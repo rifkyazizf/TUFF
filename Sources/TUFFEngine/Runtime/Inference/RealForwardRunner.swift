@@ -755,6 +755,45 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         resetTransientState()
     }
 
+    /// Captures the sequence state at the current KV position so several
+    /// different suffixes can each be prefilled from the same prefix.
+    /// Attention KV is rewound by cursor; the Gated-DeltaNet state is
+    /// recurrent, so it is copied out and back. N-gram and multimodal RoPE
+    /// state are not captured, so those configurations are refused rather
+    /// than restored incompletely.
+    public func checkpoint() throws -> RunnerCheckpoint {
+        guard let kv, kv.position > 0 else {
+            throw PrefillError.prefillCursorMismatch(
+                "checkpoint requires a prefilled KV cache")
+        }
+        guard ngramRows == nil, qwenMultimodalRopeDelta == 0 else {
+            throw PrefillError.chunkedUnsupported(
+                "checkpoint does not capture n-gram or multimodal RoPE state")
+        }
+        return RunnerCheckpoint(position: kv.position, gdn: gdnState?.snapshot())
+    }
+
+    /// Returns to `checkpoint`. Only valid while everything written since the
+    /// checkpoint lies after its position, which holds because rewind and
+    /// restore are the only ways back.
+    public func restore(_ checkpoint: RunnerCheckpoint) throws {
+        guard let kv, checkpoint.position <= kv.position else {
+            throw PrefillError.prefillCursorMismatch(
+                "restore target \(checkpoint.position) is past the KV position")
+        }
+        guard (checkpoint.gdn == nil) == (gdnState == nil) else {
+            throw PrefillError.prefillCursorMismatch(
+                "checkpoint was taken from a runner with a different GDN layout")
+        }
+        kv.rewind(to: checkpoint.position)
+        if let gdnState, let snapshot = checkpoint.gdn {
+            gdnState.restore(snapshot)
+        }
+        speculativeStartPosition = nil
+        speculativeProcessedTokens = 0
+        resetTransientState()
+    }
+
     private func resetTransientState() {
         prefillChunkState.reset()
         rdadviseSkipUntilPosition = -1

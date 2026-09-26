@@ -196,6 +196,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     static let chatCompletionsPath = "/v1/chat/completions"
+    static let systemOnePath = "/v1/systemone"
 
     static func requestPath(_ head: HTTPRequestHead) -> String {
         head.uri.split(separator: "?", maxSplits: 1,
@@ -203,11 +204,19 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             .first.map(String.init) ?? head.uri
     }
 
-    static func carriesChatBody(_ head: HTTPRequestHead) -> Bool {
-        head.method == .POST
-            && requestPath(head) == chatCompletionsPath
-            && head.headers.first(name: "content-type")?
-                .lowercased().hasPrefix("application/json") == true
+    /// Paths whose bodies are buffered for a handler to decode. Both are
+    /// application/json POSTs; the systemone body carries no `messages`, so the
+    /// parser stages nothing and passes it through unchanged.
+    static func carriesBufferedBody(_ head: HTTPRequestHead) -> Bool {
+        guard head.method == .POST,
+              head.headers.first(name: "content-type")?
+                .lowercased().hasPrefix("application/json") == true else {
+            return false
+        }
+        switch requestPath(head) {
+        case chatCompletionsPath, systemOnePath: return true
+        default: return false
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -216,9 +225,9 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             guard !discardingUntilClose else { return }
             self.head = head
             // The parser stages inline images to disk, so it is created only
-            // once the request is known to carry a chat body. A body sent
+            // once the request is known to carry a buffered body. A body sent
             // elsewhere is counted and dropped.
-            bodyParser = Self.carriesChatBody(head)
+            bodyParser = Self.carriesBufferedBody(head)
                 ? StreamingChatRequestBody(attachmentRoot: attachmentRoot,
                                            visionCapability: visionCapability)
                 : nil
@@ -336,7 +345,17 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 return
             }
             handleCompletion(body: body, context: context)
-        case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"):
+        case (.POST, ServerHTTPHandler.systemOnePath):
+            guard head.headers.first(name: "content-type")?
+                .lowercased().hasPrefix("application/json") == true else {
+                writeError(context, status: .unsupportedMediaType,
+                           OpenAIErrorEnvelope(message: "content-type must be application/json",
+                                               code: "unsupported_media_type"))
+                return
+            }
+            handleSystemOne(body: body, context: context)
+        case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"),
+             (_, ServerHTTPHandler.systemOnePath):
             writeError(context, status: .methodNotAllowed,
                        OpenAIErrorEnvelope(message: "method not allowed",
                                            code: "method_not_allowed"))
@@ -459,6 +478,69 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             writeError(context,
                        status: error.httpStatus,
                        error.envelope)
+        } catch {
+            writeError(context, status: .badRequest,
+                       OpenAIErrorEnvelope(message: "malformed JSON request",
+                                           code: "invalid_json"))
+        }
+    }
+
+    /// A typed-decision request: decode, validate, then score every question
+    /// behind the same queue and admission control as a completion. The answer
+    /// is one JSON body, so there is no streaming path here.
+    private func handleSystemOne(body: ParsedChatRequestBody,
+                                 context: ChannelHandlerContext) {
+        do {
+            let request = try SystemOneRequestValidator.validate(
+                body.json, modelID: modelID, dialect: chatDialect)
+            let responseID = "sysone-" + UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+            let contextBox = SendableContext(context)
+            let phaseState = RequestPhaseState()
+            inFlightRequests += 1
+            activeTask = childChannels.startTask {
+                // Back on the event loop, where `inFlightRequests` lives.
+                defer {
+                    contextBox.value.eventLoop.execute {
+                        self.inFlightRequests -= 1
+                    }
+                }
+                let started = ContinuousClock.now
+                ServerLog.accepted(id: responseID, streaming: false)
+                do {
+                    let response = try await self.coordinator.runPreparing(
+                        onQueued: {
+                            phaseState.set("queued")
+                            ServerLog.queued(id: responseID)
+                        },
+                        prepare: {},
+                        operation: { _ in
+                            try Task.checkCancellation()
+                            phaseState.set("scoring")
+                            return try await self.backend.scoreSystemOne(request)
+                        })
+                    ServerLog.completed(id: responseID,
+                                        duration: started.duration(to: .now),
+                                        completion: ServerCompletion(
+                                            content: "",
+                                            toolCalls: [],
+                                            finishReason: "stop",
+                                            usage: OpenAIUsage(
+                                                promptTokens: response.usage.inputTokens,
+                                                completionTokens: 0,
+                                                totalTokens: response.usage.inputTokens)))
+                    self.writeCodable(contextBox.value, status: .ok, response,
+                                      sortedKeys: true)
+                } catch {
+                    self.handleAsyncError(error,
+                                          context: contextBox.value,
+                                          id: responseID,
+                                          phase: phaseState.value,
+                                          stream: false,
+                                          started: started)
+                }
+            }
+        } catch let error as ServerRequestError {
+            writeError(context, status: error.httpStatus, error.envelope)
         } catch {
             writeError(context, status: .badRequest,
                        OpenAIErrorEnvelope(message: "malformed JSON request",
@@ -673,8 +755,13 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private func writeCodable<T: Encodable>(_ context: ChannelHandlerContext,
                                             status: HTTPResponseStatus,
                                             _ value: T,
+                                            sortedKeys: Bool = false,
                                             closeAfter: Bool = false) {
-        guard let data = try? JSONEncoder().encode(value) else { return }
+        let encoder = JSONEncoder()
+        // The encoder's key order is not stable between calls, so a body that
+        // must answer the same request with the same bytes asks for sorted keys.
+        if sortedKeys { encoder.outputFormatting = [.sortedKeys] }
+        guard let data = try? encoder.encode(value) else { return }
         writeData(context, status: status, data: data, closeAfter: closeAfter)
     }
 

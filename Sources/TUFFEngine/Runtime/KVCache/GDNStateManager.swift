@@ -89,6 +89,42 @@ public final class GDNStateManager {
         zeroAll()
     }
 
+    /// CPU copy of every layer's recurrent state and conv tail. The state is
+    /// recurrent rather than positional, so it cannot be rewound like KV rows;
+    /// returning to an earlier position means copying it back. Callers take
+    /// the snapshot only after the GPU work that wrote it has completed.
+    public struct Snapshot {
+        fileprivate let states: [Data?]
+        fileprivate let convTails: [Data?]
+    }
+
+    public func snapshot() -> Snapshot {
+        func copy(_ buffer: MTLBuffer?) -> Data? {
+            buffer.map { Data(bytes: $0.contents(), count: $0.length) }
+        }
+        return Snapshot(states: stateBuffers.map(copy),
+                        convTails: convTailBuffers.map(copy))
+    }
+
+    public func restore(_ snapshot: Snapshot) {
+        func copyBack(_ data: Data?, into buffer: MTLBuffer?) {
+            guard let data, let buffer else {
+                precondition(data == nil && buffer == nil,
+                             "GDN snapshot layout does not match this state manager")
+                return
+            }
+            precondition(data.count == buffer.length,
+                         "GDN snapshot buffer size does not match this state manager")
+            data.withUnsafeBytes { memcpy(buffer.contents(), $0.baseAddress!, data.count) }
+        }
+        precondition(snapshot.states.count == stateBuffers.count,
+                     "GDN snapshot layer count does not match this state manager")
+        for layer in stateBuffers.indices {
+            copyBack(snapshot.states[layer], into: stateBuffers[layer])
+            copyBack(snapshot.convTails[layer], into: convTailBuffers[layer])
+        }
+    }
+
     private func zeroAll() {
         for buffer in stateBuffers {
             if let buffer { memset(buffer.contents(), 0, buffer.length) }

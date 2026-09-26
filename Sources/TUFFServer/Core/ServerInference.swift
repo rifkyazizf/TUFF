@@ -267,6 +267,10 @@ public protocol ServerInferenceBackend: Sendable {
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
     func generate(_ prepared: ServerPreparedRequest,
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
+    /// Answers a typed-decision request. Every question is answered from its
+    /// own prefill, so the endpoint needs a tokenizer and a logits head; a
+    /// backend that has neither refuses here.
+    func scoreSystemOne(_ request: ValidatedSystemOneRequest) async throws -> SystemOneResponse
 }
 
 public struct ServerCoordinatorActivity: Equatable, Sendable {
@@ -289,6 +293,16 @@ public extension ServerInferenceBackend {
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
     ) async throws -> ServerCompletion {
         try await generate(prepared.request, onEvent: onEvent)
+    }
+
+    /// Test doubles and future backends without a tokenizer keep compiling;
+    /// the endpoint answers 400 rather than pretending it can score.
+    func scoreSystemOne(
+        _ request: ValidatedSystemOneRequest
+    ) async throws -> SystemOneResponse {
+        throw ServerRequestError.invalid(
+            message: "systemone is not supported by this backend",
+            param: nil, code: "unsupported_value")
     }
 }
 
@@ -503,6 +517,15 @@ enum ServerRequestImages {
     }
 }
 
+/// A systemone request that wanted the shared-prefix path but cannot use it.
+/// Written in `ServerLog`'s line shape, which lives outside this change, so the
+/// fallback reaches the same stderr stream an operator already reads.
+private func logSystemOnePrefixReuseFallback(reason: String) {
+    let line = "[\(Date().formatted(.iso8601))] "
+        + "systemone prefix reuse fallback reason=\(reason)\n"
+    FileHandle.standardError.write(Data(line.utf8))
+}
+
 public actor ServerModelSession: ServerInferenceBackend {
     /// Chat dialect of the loaded tokenizer; drives request-validation rules.
     public nonisolated let chatDialect: ChatDialect
@@ -526,6 +549,17 @@ public actor ServerModelSession: ServerInferenceBackend {
     public nonisolated let visionCapability: String
     private let visionRuntime: VisionRuntime?
     private let visionResidencyPolicy: VisionResidencyPolicy
+    /// `--systemone-system-prompt`: used by a request that sends no system text
+    /// of its own.
+    private let systemOneSystemPrompt: String?
+    /// `--systemone-prefix-reuse`: prefill the prefix a request's questions all
+    /// share once, then each question's suffix from a checkpoint. Off, every
+    /// question is prefilled whole, which is what the endpoint did before.
+    private let systemOnePrefixReuse: Bool
+    /// Label → its single token id. Encoding a label is a real tokenizer call,
+    /// and the same handful of labels ("Yes", "A"…) recurs across requests, so
+    /// the check that a label is one token runs once per label.
+    private var systemOneLabelIDs: [String: Int32] = [:]
 
     /// What the cached KV was actually produced by. Six configuration fields
     /// plus every `TUFF_*` variable in the environment: those select
@@ -578,6 +612,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                             visionPackURL: URL? = nil,
                             visionResidencyPolicy: VisionResidencyPolicy = .onDemand,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            systemOneSystemPrompt: String? = nil,
+                            systemOnePrefixReuse: Bool = true,
                             runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
@@ -669,7 +705,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                                   promptCacheDomain: promptCacheDomain,
                                   visionRuntime: visionRuntime,
                                   visionCapability: visionCapability,
-                                  visionResidencyPolicy: visionResidencyPolicy)
+                                  visionResidencyPolicy: visionResidencyPolicy,
+                                  systemOneSystemPrompt: systemOneSystemPrompt,
+                                  systemOnePrefixReuse: systemOnePrefixReuse)
     }
 
     static func hardwareVisionCapability(
@@ -699,7 +737,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                  promptCacheDomain: ServerPromptCacheDomain,
                  visionRuntime: VisionRuntime?,
                  visionCapability: String,
-                 visionResidencyPolicy: VisionResidencyPolicy) {
+                 visionResidencyPolicy: VisionResidencyPolicy,
+                 systemOneSystemPrompt: String?,
+                 systemOnePrefixReuse: Bool) {
         self.context = context
         self.model = model
         self.tokenizer = tokenizer
@@ -717,6 +757,151 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.visionRuntime = visionRuntime
         self.visionResidencyPolicy = visionResidencyPolicy
         self.visionCapability = visionCapability
+        self.systemOneSystemPrompt = systemOneSystemPrompt
+        self.systemOnePrefixReuse = systemOnePrefixReuse
+    }
+
+    // MARK: - Typed decisions
+
+    /// One question's tokens under the shared-prefix plan: what the whole prompt
+    /// is, what follows the shared prefix, and which label tokens to read.
+    private struct SystemOneQuestionTokens {
+        let question: SystemOneQuestion
+        /// `prefix + suffix`, what the per-question path prefills.
+        let promptIDs: [Int32]
+        /// Only this question's tokens, what the reuse path prefills after the
+        /// shared prefix.
+        let suffixIDs: [Int32]
+        let labelIDs: [Int32]
+    }
+
+    /// One prefill per question, or one shared prefix and one per-question
+    /// suffix when reuse is on. The runner is reset and the log-probabilities of
+    /// each question's label tokens are read at the assistant's first position.
+    /// Nothing is generated, so the model cannot answer anything but one of the
+    /// offered labels.
+    public func scoreSystemOne(
+        _ request: ValidatedSystemOneRequest
+    ) async throws -> SystemOneResponse {
+        // The runner's live state after this request is a systemone prompt, and
+        // the chat cache describes a chat prompt: the next chat request must
+        // prefill rather than resume. Failures leave the same mismatch behind,
+        // so this runs on both paths.
+        defer {
+            promptCache.invalidate()
+            runner.reset()
+        }
+        let system = SystemOnePrompt.effectiveSystem(request: request.system,
+                                                     server: systemOneSystemPrompt)
+        let prefix = try SystemOnePrompt.renderPrefix(state: request.state, system: system)
+        let prefixIDs = tokenizer.encode(prefix, addBOS: false)
+        // Tokenize every question before any prefill: the context check must
+        // reject the request before the GPU runs, and the reuse path needs to
+        // know that the prefix and each suffix tokenize independently.
+        var questions: [SystemOneQuestionTokens] = []
+        questions.reserveCapacity(request.questions.count)
+        var inputTokens = 0
+        var joinFailure: String?
+        for question in request.questions {
+            try Task.checkCancellation()
+            let suffix = try SystemOnePrompt.renderSuffix(question: question)
+            let promptIDs = tokenizer.encode(prefix + suffix, addBOS: false)
+            // Checked here so an over-long prompt is the client's 400, not the
+            // engine's context-overflow error surfacing as a 500.
+            guard promptIDs.count < maxContext else {
+                throw ServerRequestError.invalid(
+                    message: "prompt exceeds the configured context",
+                    param: "state",
+                    code: "context_length_exceeded")
+            }
+            let labelIDs = try systemOneLabelTokenIDs(
+                for: SystemOnePrompt.labels(for: question))
+            var suffixIDs: [Int32] = []
+            if systemOnePrefixReuse {
+                suffixIDs = tokenizer.encode(suffix, addBOS: false)
+                // BPE can merge a token across the join, which would make the
+                // suffix alone prefill differently from the joined prompt. Any
+                // question that does means the whole request takes the
+                // per-question path.
+                if joinFailure == nil, promptIDs != prefixIDs + suffixIDs {
+                    joinFailure = "question \(String(reflecting: question.key)) "
+                        + "does not tokenize as prefix + suffix"
+                }
+            }
+            inputTokens += promptIDs.count
+            questions.append(SystemOneQuestionTokens(
+                question: question, promptIDs: promptIDs,
+                suffixIDs: suffixIDs, labelIDs: labelIDs))
+        }
+
+        if systemOnePrefixReuse, joinFailure == nil {
+            do {
+                let readouts = questions.map {
+                    LabelReadout(suffixIds: $0.suffixIDs, labelIDs: $0.labelIDs)
+                }
+                let logProbs = try await prefillSharedPrefixLabelLogProbs(
+                    runner: runner,
+                    prefixIds: prefixIDs,
+                    readouts: readouts,
+                    scratch: scratch,
+                    prefillConfig: prefillConfig)
+                let answers = try zip(questions, logProbs).map { plan, values in
+                    SystemOneAnswerEntry(
+                        key: plan.question.key,
+                        answer: try SystemOneMath.answer(
+                            for: plan.question,
+                            probabilities: SystemOneMath.probabilities(fromLogProbs: values)))
+                }
+                return SystemOneResponse(
+                    model: request.model,
+                    answers: SystemOneAnswers(entries: answers),
+                    usage: SystemOneUsage(inputTokens: inputTokens, outputTokens: 0))
+            } catch let error as PrefillError {
+                // A runner that cannot checkpoint is a capability gap, not a
+                // request fault: answer the request the way it was answered
+                // before reuse existed.
+                guard case .chunkedUnsupported = error else { throw error }
+                logSystemOnePrefixReuseFallback(reason: error.description)
+            }
+        } else if let joinFailure {
+            logSystemOnePrefixReuseFallback(reason: joinFailure)
+        }
+
+        var answers: [SystemOneAnswerEntry] = []
+        answers.reserveCapacity(questions.count)
+        for plan in questions {
+            try Task.checkCancellation()
+            let logProbs = try await prefillLabelLogProbs(
+                producer: runner,
+                promptIds: plan.promptIDs,
+                labelIDs: plan.labelIDs,
+                scratch: scratch,
+                prefillConfig: prefillConfig)
+            answers.append(SystemOneAnswerEntry(
+                key: plan.question.key,
+                answer: try SystemOneMath.answer(
+                    for: plan.question,
+                    probabilities: SystemOneMath.probabilities(fromLogProbs: logProbs))))
+        }
+        return SystemOneResponse(
+            model: request.model,
+            answers: SystemOneAnswers(entries: answers),
+            usage: SystemOneUsage(inputTokens: inputTokens, outputTokens: 0))
+    }
+
+    /// A label the tokenizer splits into several tokens has no single readout
+    /// position, so there is nothing to score: the label itself is the fault
+    /// and is named in the error.
+    private func systemOneLabelTokenIDs(for labels: [String]) throws -> [Int32] {
+        try labels.map { label in
+            if let cached = systemOneLabelIDs[label] { return cached }
+            let ids = tokenizer.encode(label, addBOS: false)
+            guard ids.count == 1 else {
+                throw SystemOneError.labelIsNotSingleToken(label: label, count: ids.count)
+            }
+            systemOneLabelIDs[label] = ids[0]
+            return ids[0]
+        }
     }
 
     public func generate(

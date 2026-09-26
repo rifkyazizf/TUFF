@@ -1,5 +1,11 @@
 import Metal
 
+/// A KV cursor plus a copy of the recurrent state, taken after a prefill.
+public struct RunnerCheckpoint {
+    let position: Int
+    let gdn: GDNStateManager.Snapshot?
+}
+
 /// Family-neutral production runner used by the CLI, app, and server. The
 /// existing Gemma/Qwen implementation remains untouched; GPT-OSS selects its
 /// BF16/MXFP4 layer graph after the model has passed normal load validation.
@@ -106,6 +112,24 @@ public final class ModelForwardRunner: ChunkedPrefillRunner,
             try runner.prepareForContinuation(expectedPosition: expectedPosition)
         case .gptOss(let runner):
             try runner.prepareForContinuation(expectedPosition: expectedPosition)
+        }
+    }
+
+    /// Sequence state at a prefilled position; see `RealForwardRunner.checkpoint`.
+    /// GPT-OSS has no checkpoint support, so callers fall back to full prefills.
+    public func checkpoint() throws -> RunnerCheckpoint {
+        switch backend {
+        case .affine(let runner): return try runner.checkpoint()
+        case .gptOss:
+            throw PrefillError.chunkedUnsupported("GPT-OSS does not support checkpoints")
+        }
+    }
+
+    public func restore(_ checkpoint: RunnerCheckpoint) throws {
+        switch backend {
+        case .affine(let runner): try runner.restore(checkpoint)
+        case .gptOss:
+            throw PrefillError.chunkedUnsupported("GPT-OSS does not support checkpoints")
         }
     }
 

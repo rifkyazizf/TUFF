@@ -36,6 +36,8 @@ do {
         },
         visionResidencyPolicy: arguments.visionResidency,
         promptCacheMode: arguments.promptCacheMode,
+        systemOneSystemPrompt: arguments.systemOneSystemPrompt,
+        systemOnePrefixReuse: arguments.systemOnePrefixReuse,
         runtimeConfiguration: runtimeConfiguration)
     let modelID = arguments.modelIDOverride ?? backend.defaultModelID
     let server = TUFFHTTPServer(

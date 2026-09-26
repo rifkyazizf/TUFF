@@ -18,6 +18,11 @@ public struct ServerArguments: Equatable, Sendable {
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
+    /// Extra system text for every /v1/systemone prompt that carries none.
+    public let systemOneSystemPrompt: String?
+    /// Whether /v1/systemone prefills the prefix shared by all of a request's
+    /// questions once, or re-prefills each question's whole prompt.
+    public let systemOnePrefixReuse: Bool
 
     public static let usage = """
     usage: TUFFServer --model <completed .gturbo directory> [options]
@@ -44,6 +49,13 @@ public struct ServerArguments: Equatable, Sendable {
                                  expert pool, so larger chunks read less.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
+      --systemone-system-prompt <text>
+                                 System text appended to the /v1/systemone
+                                 framing for requests that send none.
+      --systemone-prefix-reuse <on|off>
+                                 Prefill the prefix every /v1/systemone question
+                                 shares once (default on). Off re-prefills each
+                                 question's whole prompt.
       --help                     Show this help.
     """
 
@@ -92,6 +104,8 @@ public struct ServerArguments: Equatable, Sendable {
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var rdadvisePolicy = RDAdvicePolicyMode.off
+        var systemOneSystemPrompt: String?
+        var systemOnePrefixReuse = true
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -162,6 +176,20 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid("--prefill-chunk-tokens must be 32, 64, or 128")
                 }
                 prefillChunkTokens = parsed
+            case "--systemone-system-prompt":
+                guard !value.isEmpty else {
+                    throw ServerArgumentError.invalid(
+                        "--systemone-system-prompt must not be empty")
+                }
+                systemOneSystemPrompt = value
+            case "--systemone-prefix-reuse":
+                switch value {
+                case "on": systemOnePrefixReuse = true
+                case "off": systemOnePrefixReuse = false
+                default:
+                    throw ServerArgumentError.invalid(
+                        "--systemone-prefix-reuse must be on or off")
+                }
             case "--rdadvise":
                 guard let parsed = RDAdvicePolicyMode(rawValue: value) else {
                     throw ServerArgumentError.invalid(
@@ -185,7 +213,9 @@ public struct ServerArguments: Equatable, Sendable {
                                prefillChunkTokens: prefillChunkTokens,
                                rdadvisePolicy: rdadvisePolicy,
                                visionPack: visionPack,
-                               visionResidency: visionResidency)
+                               visionResidency: visionResidency,
+                               systemOneSystemPrompt: systemOneSystemPrompt,
+                               systemOnePrefixReuse: systemOnePrefixReuse)
     }
 }
 

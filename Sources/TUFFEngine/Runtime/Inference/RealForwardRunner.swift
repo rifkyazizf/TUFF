@@ -302,6 +302,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let onesPerExpertScale: MTLBuffer?
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
+    /// Lazily allocated once, then reused for every layer's staging burst.
+    private var prefillStagingArena: PrefillExpertStagingArena?
     private var speculativeStartPosition: Int?
     private var speculativeProcessedTokens = 0
     private var collectingSpeculativeMetrics = false
@@ -332,6 +334,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     /// `forceLogitsHead: true` or they read a never-written buffer.
     private let useFusedGreedyHead: Bool
     private let prefillAttentionPath: RuntimePrefillAttentionPath
+    private let prefillExpertStagingEnabled: Bool
     public let rdadviseEnabled: Bool
     public let rdadvisePolicyMode: RDAdvicePolicyMode
     private var rdadviseSkipUntilPosition: Int = -1
@@ -362,6 +365,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
             && !config.hyperConnection.isEnabled
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
+        self.prefillExpertStagingEnabled = runtimeConfiguration.prefillExpertStaging
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
         self.rdadvisePolicyMode = runtimeConfiguration.rdadvisePolicy
         self.rdadviseAdaptiveState = RDAdviceAdaptivePolicyState(
@@ -1270,6 +1274,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         let scratch = try PrefillChunkScratchBuffers.allocate(device: ctx.device, layout: layout)
         prefillScratch = scratch
         return scratch
+    }
+
+    /// One slot per expert id (≈453 MB for a 256-expert qwen36 layer), so any
+    /// layer's routed union fits. Reused across layers: each layer's tiles are
+    /// fully drained before the next layer stages its own union.
+    private func prefillExpertStagingArena() throws -> PrefillExpertStagingArena {
+        if let prefillStagingArena { return prefillStagingArena }
+        let slotSize = try model.routedExpertStagingSlotSize(layer: 0)
+        let arena = try PrefillExpertStagingArena(device: ctx.device,
+                                                  capacity: cfg.numExperts,
+                                                  slotSize: slotSize)
+        prefillStagingArena = arena
+        return arena
     }
 
     /// Copy the chunk's last-token residual out of device-private scratch so a
@@ -2528,82 +2545,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                         }
                     }
 
-                    let routedTileScheduler = PrefillRoutedTileScheduler(config: schedulerConfig)
-                    for (tileIndex, tile) in routes.tiles.enumerated() {
-                        let expertIDs = try PrefillStreamedTileBinding.expertIDs(
-                            forTile: tileIndex,
-                            routes: routes)
-                        var plannedFetch: RoutedExpertFetchPlan?
-                        if !pendingTiles.isEmpty {
-                            let pendingAssignedSlots = pendingTiles.flatMap(\.fetch.plannedAssignedSlots)
-                            if !pendingAssignedSlots.isEmpty {
-                                let pendingSlots = Set(pendingAssignedSlots)
-                                let plan = try model.planRoutedExpertsIfPossible(
-                                    layer: L,
-                                    experts: expertIDs,
-                                    avoidingSlots: pendingSlots)
-                                let decision = routedTileScheduler.decide(
-                                    PrefillRoutedTileSchedulerInput(
-                                        hasPendingTile: true,
-                                        pendingDepth: pendingTiles.count,
-                                        pendingAssignedSlots: pendingAssignedSlots,
-                                        avoidingSlotPlanAvailable: plan != nil))
-                                switch decision {
-                                case .prefetchNext:
-                                    guard let plan else {
-                                        throw ModelError.indexCorrupt(
-                                            detail: "routed tile scheduler requested missing plan")
-                                    }
-                                    plannedFetch = plan
-                                case .drainBeforeIssue:
-                                    try drainOldestPendingTile()
-                                case .issueWithoutPending:
-                                    throw ModelError.indexCorrupt(
-                                        detail: "routed tile scheduler ignored pending tile")
-                                }
-                            } else {
-                                let decision = routedTileScheduler.decide(
-                                    PrefillRoutedTileSchedulerInput(
-                                        hasPendingTile: true,
-                                        pendingDepth: pendingTiles.count,
-                                        pendingAssignedSlots: [],
-                                        avoidingSlotPlanAvailable: false))
-                                switch decision {
-                                case .drainBeforeIssue:
-                                    try drainOldestPendingTile()
-                                case .issueWithoutPending, .prefetchNext:
-                                    throw ModelError.indexCorrupt(
-                                        detail: "routed tile scheduler failed to drain empty-slot pending tile")
-                                }
-                            }
-                        } else {
-                            let decision = routedTileScheduler.decide(
-                                PrefillRoutedTileSchedulerInput(
-                                    hasPendingTile: false,
-                                    pendingAssignedSlots: [],
-                                    avoidingSlotPlanAvailable: false))
-                            switch decision {
-                            case .issueWithoutPending:
-                                break
-                            case .prefetchNext, .drainBeforeIssue:
-                                throw ModelError.indexCorrupt(
-                                    detail: "routed tile scheduler requested pending action without pending tile")
-                            }
-                        }
-                        let fetchStart = profiling ? now() : 0
-                        let fetch = try await PrefillStreamedTileBinding.fetchBindingForTile(
-                            model: model,
-                            layer: L,
-                            tileIndex: tileIndex,
-                            routes: routes,
-                            plannedFetch: plannedFetch,
-                            avoidingSlots: Set(pendingTiles.flatMap(\.fetch.plannedAssignedSlots)))
-                        if profiling {
-                            prefillProfile.add(\.expertFetch, now() - fetchStart)
-                            prefillProfile.tiles += 1
-                            prefillProfile.expertsMissed += fetch.plannedMissSlots.count
-                            prefillProfile.expertsUsed += expertIDs.count
-                        }
+                    /// Encodes and queues one tile. Shared by both fetch paths
+                    /// so tile math, reduce inputs and bounds checks cannot
+                    /// drift between them.
+                    func encodePendingTile(tileIndex: Int,
+                                           tile: PrefillMoETile,
+                                           fetch: PrefillStreamedTileFetchResult) throws {
                         recordSpeculativeFetch(layer: L, fetch: fetch)
                         try fetch.binding.validateCoversPairs(routes.sortedPairs,
                                                               pairStart: Int(tile.pairStart),
@@ -2643,12 +2590,143 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                                                commandBuffer: tileCB,
                                                                fetch: fetch,
                                                                argumentBuffer: argumentBuffer))
-                        while pendingTiles.count > schedulerConfig.maxPendingDepth {
+                    }
+
+                    if prefillExpertStagingEnabled {
+                        // Read the layer's whole routed union in one burst, then
+                        // run every tile back-to-back off the shared arena: no
+                        // per-tile fetch wait, and SSD queue depth comes from the
+                        // read pool instead of one tile's eight experts.
+                        let union = routes.groups.map { Int($0.expert) }
+                        let arena = try prefillExpertStagingArena()
+                        let burstStart = profiling ? now() : 0
+                        let stagedViews = try await model.stageRoutedExperts(
+                            layer: L, experts: union, into: arena)
+                        if profiling {
+                            prefillProfile.add(\.expertFetch, now() - burstStart)
+                            prefillProfile.expertsMissed += union.count
+                        }
+                        var viewByExpert: [Int: TensorView] = [:]
+                        viewByExpert.reserveCapacity(union.count)
+                        for (expert, view) in zip(union, stagedViews) {
+                            viewByExpert[expert] = view
+                        }
+                        for (tileIndex, tile) in routes.tiles.enumerated() {
+                            let expertIDs = try PrefillStreamedTileBinding.expertIDs(
+                                forTile: tileIndex, routes: routes)
+                            let views = try expertIDs.map { expert -> TensorView in
+                                guard let view = viewByExpert[expert] else {
+                                    throw PrefillGroupedRoutedMoEError.invalidStreamedTileBinding(
+                                        "tile expert \(expert) was not staged")
+                                }
+                                return view
+                            }
+                            if profiling {
+                                prefillProfile.tiles += 1
+                                prefillProfile.expertsUsed += expertIDs.count
+                            }
+                            try encodePendingTile(
+                                tileIndex: tileIndex,
+                                tile: tile,
+                                fetch: PrefillStreamedTileFetchResult(
+                                    expertIDs: expertIDs,
+                                    binding: PrefillStreamedTileBinding(expertIDs: expertIDs,
+                                                                       views: views),
+                                    usedPlannedFetch: false,
+                                    plannedHits: 0,
+                                    plannedMissIndices: [],
+                                    plannedAssignedSlots: [],
+                                    plannedMissSlots: []))
+                        }
+                        // Drain before the next layer overwrites the arena.
+                        while !pendingTiles.isEmpty {
                             try drainOldestPendingTile()
                         }
-                    }
-                    while !pendingTiles.isEmpty {
-                        try drainOldestPendingTile()
+                    } else {
+                        let routedTileScheduler = PrefillRoutedTileScheduler(config: schedulerConfig)
+                        for (tileIndex, tile) in routes.tiles.enumerated() {
+                            let expertIDs = try PrefillStreamedTileBinding.expertIDs(
+                                forTile: tileIndex,
+                                routes: routes)
+                            var plannedFetch: RoutedExpertFetchPlan?
+                            if !pendingTiles.isEmpty {
+                                let pendingAssignedSlots = pendingTiles.flatMap(\.fetch.plannedAssignedSlots)
+                                if !pendingAssignedSlots.isEmpty {
+                                    let pendingSlots = Set(pendingAssignedSlots)
+                                    let plan = try model.planRoutedExpertsIfPossible(
+                                        layer: L,
+                                        experts: expertIDs,
+                                        avoidingSlots: pendingSlots)
+                                    let decision = routedTileScheduler.decide(
+                                        PrefillRoutedTileSchedulerInput(
+                                            hasPendingTile: true,
+                                            pendingDepth: pendingTiles.count,
+                                            pendingAssignedSlots: pendingAssignedSlots,
+                                            avoidingSlotPlanAvailable: plan != nil))
+                                    switch decision {
+                                    case .prefetchNext:
+                                        guard let plan else {
+                                            throw ModelError.indexCorrupt(
+                                                detail: "routed tile scheduler requested missing plan")
+                                        }
+                                        plannedFetch = plan
+                                    case .drainBeforeIssue:
+                                        try drainOldestPendingTile()
+                                    case .issueWithoutPending:
+                                        throw ModelError.indexCorrupt(
+                                            detail: "routed tile scheduler ignored pending tile")
+                                    }
+                                } else {
+                                    let decision = routedTileScheduler.decide(
+                                        PrefillRoutedTileSchedulerInput(
+                                            hasPendingTile: true,
+                                            pendingDepth: pendingTiles.count,
+                                            pendingAssignedSlots: [],
+                                            avoidingSlotPlanAvailable: false))
+                                    switch decision {
+                                    case .drainBeforeIssue:
+                                        try drainOldestPendingTile()
+                                    case .issueWithoutPending, .prefetchNext:
+                                        throw ModelError.indexCorrupt(
+                                            detail: "routed tile scheduler failed to drain empty-slot pending tile")
+                                    }
+                                }
+                            } else {
+                                let decision = routedTileScheduler.decide(
+                                    PrefillRoutedTileSchedulerInput(
+                                        hasPendingTile: false,
+                                        pendingAssignedSlots: [],
+                                        avoidingSlotPlanAvailable: false))
+                                switch decision {
+                                case .issueWithoutPending:
+                                    break
+                                case .prefetchNext, .drainBeforeIssue:
+                                    throw ModelError.indexCorrupt(
+                                        detail: "routed tile scheduler requested pending action without pending tile")
+                                }
+                            }
+                            let fetchStart = profiling ? now() : 0
+                            let fetch = try await PrefillStreamedTileBinding.fetchBindingForTile(
+                                model: model,
+                                layer: L,
+                                tileIndex: tileIndex,
+                                routes: routes,
+                                plannedFetch: plannedFetch,
+                                avoidingSlots: Set(pendingTiles.flatMap(\.fetch.plannedAssignedSlots)))
+                            if profiling {
+                                prefillProfile.add(\.expertFetch, now() - fetchStart)
+                                prefillProfile.tiles += 1
+                                prefillProfile.expertsMissed += fetch.plannedMissSlots.count
+                                prefillProfile.expertsUsed += expertIDs.count
+                            }
+                            try encodePendingTile(tileIndex: tileIndex, tile: tile, fetch: fetch)
+                            while pendingTiles.count > schedulerConfig.maxPendingDepth {
+                                try drainOldestPendingTile()
+                            }
+                        }
+                        while !pendingTiles.isEmpty {
+                            try drainOldestPendingTile()
+                        }
                     }
                     guard let tailCB = makePrefillCommandBuffer() else {
                         throw ModelError.residentBufferWrapFailed

@@ -141,6 +141,55 @@ import Metal
         #expect(runner.lastGreedyToken == reference)
     }
 
+    /// Staging only moves where the routed weights are read from, so a chunked
+    /// prefill must produce byte-identical logits with staging on and off —
+    /// including when the prompt spans more than one chunk and the off path's
+    /// decode cache is warm from the previous chunk.
+    @Test func prefillExpertStaging_matchesStreamedTileLogits() async throws {
+        let dir = try QwenToySynthetic.write()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ctx = try MetalContext()
+
+        func prefillBytes(staging: Bool,
+                          tokens: [Int32],
+                          chunkTokens: Int) async throws -> [UInt8] {
+            let model = try Model.load(directoryURL: dir,
+                                       device: ctx.device,
+                                       expecting: .qwen36Toy())
+            let runner = try RealForwardRunner(
+                model: model,
+                context: ctx,
+                maxContext: 64,
+                runtimeConfiguration: RuntimeConfiguration(
+                    prefillExpertStaging: staging))
+            let logits = try makeLogits(ctx, vocab: 1024)
+            let result = try await runner.prefillChunked(
+                tokens: tokens[...],
+                startPosition: 0,
+                outputMode: .logits,
+                config: .production(chunkTokens: chunkTokens),
+                into: logits,
+                onProgress: { _ in })
+            #expect(result.newPosition == tokens.count)
+            return Array(UnsafeRawBufferPointer(start: logits.contents(),
+                                                count: logits.length))
+        }
+
+        let singleChunk: [Int32] = Array(1...16)
+        let stagedSingle = try await prefillBytes(staging: true, tokens: singleChunk,
+                                                  chunkTokens: 32)
+        let streamedSingle = try await prefillBytes(staging: false, tokens: singleChunk,
+                                                    chunkTokens: 32)
+        #expect(stagedSingle == streamedSingle)
+
+        let multiChunk: [Int32] = Array(1...40)
+        let stagedMulti = try await prefillBytes(staging: true, tokens: multiChunk,
+                                                 chunkTokens: 32)
+        let streamedMulti = try await prefillBytes(staging: false, tokens: multiChunk,
+                                                   chunkTokens: 32)
+        #expect(stagedMulti == streamedMulti)
+    }
+
     /// (b) KV manager + GDN state manager interplay under the qwen mask:
     /// linear layers carry no per-token KV storage, full layers are linear
     /// append-only, and reset() returns both to the empty-context state.

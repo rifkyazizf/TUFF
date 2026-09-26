@@ -15,6 +15,7 @@ public struct ServerArguments: Equatable, Sendable {
     public let expertCachePolicy: RuntimeExpertCachePolicy
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
+    public let prefillExpertStaging: Bool
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
@@ -47,6 +48,11 @@ public struct ServerArguments: Equatable, Sendable {
       --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, 128, or 256
                                  (default 128). Each chunk re-reads the routed
                                  expert pool, so larger chunks read less.
+      --prefill-expert-staging <on|off>
+                                 Read each prefill layer's whole routed expert
+                                 union in one staged burst (default on). Off
+                                 streams it tile by tile through the decode
+                                 expert cache.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --systemone-system-prompt <text>
@@ -87,6 +93,7 @@ public struct ServerArguments: Equatable, Sendable {
             rdadvisePolicy: rdadvisePolicy,
             prefillEnabled: prefillPolicy == .chunked,
             prefillChunkTokens: prefillChunkTokens,
+            prefillExpertStaging: prefillExpertStaging,
             forceLogitsHead: forceLogitsHead)
     }
 
@@ -103,6 +110,7 @@ public struct ServerArguments: Equatable, Sendable {
         var expertCachePolicy = RuntimeExpertCachePolicy.lfu
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
+        var prefillExpertStaging = true
         var rdadvisePolicy = RDAdvicePolicyMode.off
         var systemOneSystemPrompt: String?
         var systemOnePrefixReuse = true
@@ -176,6 +184,14 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid("--prefill-chunk-tokens must be 32, 64, or 128")
                 }
                 prefillChunkTokens = parsed
+            case "--prefill-expert-staging":
+                switch value {
+                case "on": prefillExpertStaging = true
+                case "off": prefillExpertStaging = false
+                default:
+                    throw ServerArgumentError.invalid(
+                        "--prefill-expert-staging must be on or off")
+                }
             case "--systemone-system-prompt":
                 guard !value.isEmpty else {
                     throw ServerArgumentError.invalid(
@@ -211,6 +227,7 @@ public struct ServerArguments: Equatable, Sendable {
                                expertCachePolicy: expertCachePolicy,
                                prefillPolicy: prefillPolicy,
                                prefillChunkTokens: prefillChunkTokens,
+                               prefillExpertStaging: prefillExpertStaging,
                                rdadvisePolicy: rdadvisePolicy,
                                visionPack: visionPack,
                                visionResidency: visionResidency,

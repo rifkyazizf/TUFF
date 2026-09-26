@@ -46,6 +46,10 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
     public let prefillAttentionPath: RuntimePrefillAttentionPath
+    /// Stage a chunked prefill chunk's whole per-layer routed-expert union into
+    /// a dedicated arena in one burst instead of streaming it tile by tile
+    /// through the decode expert cache.
+    public let prefillExpertStaging: Bool
     public let headPath: RuntimeHeadPath
 
     public init(expertCacheSlots: Int = 16,
@@ -54,6 +58,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 prefillEnabled: Bool = true,
                 prefillChunkTokens: Int = 128,
                 prefillAttentionPath: RuntimePrefillAttentionPath = .fullTensorOps2DPreferred,
+                prefillExpertStaging: Bool = true,
                 forceLogitsHead: Bool = false) {
         precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),
                      "unsupported expert-cache slot count")
@@ -65,6 +70,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
         self.prefillPolicy = prefillEnabled ? .chunked : .off
         self.prefillChunkTokens = prefillChunkTokens
         self.prefillAttentionPath = prefillAttentionPath
+        self.prefillExpertStaging = prefillExpertStaging
         self.headPath = forceLogitsHead ? .logits : .fusedRows
     }
 

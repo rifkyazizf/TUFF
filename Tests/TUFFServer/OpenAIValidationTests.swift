@@ -847,12 +847,34 @@ struct ServerArgumentTests {
         ["--expert-cache-policy", "mru"],
         ["--prefill", "maybe"],
         ["--prefill-chunk-tokens", "512"],
+        ["--prefill-expert-staging", "maybe"],
         ["--rdadvise", "eager"],
     ])
     func rejectsUnsupportedRuntimeValues(flag: [String]) throws {
         #expect(throws: ServerArgumentError.self) {
             try ServerArguments.parse(["--model", "model.gturbo"] + flag)
         }
+    }
+
+    @Test func prefillExpertStagingFlagReachesTheResolvedConfiguration() throws {
+        let defaults = try ServerArguments.parse(["--model", "model.gturbo"])
+        #expect(defaults.prefillExpertStaging)
+        let defaultConfiguration = try defaults.resolvedRuntimeConfiguration()
+        #expect(defaultConfiguration.prefillExpertStaging)
+
+        let off = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--prefill-expert-staging", "off",
+        ])
+        #expect(!off.prefillExpertStaging)
+        let offConfiguration = try off.resolvedRuntimeConfiguration()
+        #expect(!offConfiguration.prefillExpertStaging)
+
+        let on = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--prefill-expert-staging", "on",
+        ])
+        #expect(on.prefillExpertStaging)
     }
     @Test func imageDataURLPreservesOrderedMultimodalParts() throws {
         let dataURL = "data:image/png;base64,iVBORw0KGgo="

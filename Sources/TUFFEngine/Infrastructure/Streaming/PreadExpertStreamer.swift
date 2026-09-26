@@ -56,6 +56,9 @@ public enum ExpertCachePolicy: String, Sendable {
 /// `pread`-based routed-expert streamer with a fixed per-layer slot cache.
 public final class PreadExpertStreamer: @unchecked Sendable {
     public static let scratchAlignment = 2 * 1024 * 1024
+    /// In-flight `pread`s for the prefill staging burst. Deeper than the core
+    /// count because the NVMe queue, not the CPU, is the bottleneck there.
+    private static let stagingReadConcurrency = 32
     public static var cachePolicyDefault: ExpertCachePolicy { .lfu }
 
     public let layout: StreamLayout
@@ -196,6 +199,60 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             fileOffset: layout.streamOffset + regionOffset,
             count: Int(layout.expertStride))
         return (slotBuffers[slot], 0, layout.expertStride)
+    }
+
+    /// Page-rounded allocation size of one slot. The prefill staging arena
+    /// lays its slots on this boundary so their regions are `pread`-ready.
+    public var slotLayoutSize: Int { slotAllocationSize }
+
+    /// Reads `experts` — whole `expertStride` regions at this streamer's file
+    /// offsets — into `destinations`, one destination per expert, with a
+    /// bounded pool of independent `pread`s in flight.
+    ///
+    /// The decode cache plan fans out over its handful of misses, but a chunked
+    /// prefill needs a whole layer's routed set at once and is bound by how many
+    /// `pread`s the SSD has queued, not by core count. Keeping a deep pool here
+    /// is the point of the staging path.
+    public func readExperts(experts: [Int],
+                            into destinations: [UnsafeMutableRawPointer]) throws {
+        precondition(experts.count == destinations.count,
+                     "expert destinations must match the expert list")
+        guard !experts.isEmpty else { return }
+
+        nonisolated(unsafe) let destinationPointers = destinations
+        let errorLock = NSLock()
+        nonisolated(unsafe) var firstError: Error?
+        let semaphore = DispatchSemaphore(value: Self.stagingReadConcurrency)
+        let group = DispatchGroup()
+        for index in experts.indices {
+            semaphore.wait()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+                do {
+                    // The streamer owns one layer's file, so offsets are
+                    // file-relative (`layer: 0`), exactly as `loadExpert` reads
+                    // them.
+                    let regionOffset = self.layout.expertOffset(layer: 0,
+                                                                expert: experts[index])
+                    guard regionOffset + self.layout.expertStride <= self.layout.streamSize else {
+                        throw StreamerError.offsetOutOfRange(regionOffset)
+                    }
+                    try self.readFull(into: destinationPointers[index],
+                                      fileOffset: self.layout.streamOffset + regionOffset,
+                                      count: Int(self.layout.expertStride))
+                } catch {
+                    errorLock.lock()
+                    if firstError == nil { firstError = error }
+                    errorLock.unlock()
+                }
+            }
+        }
+        group.wait()
+        if let firstError { throw firstError }
     }
 
     public func loadExpertsCached(experts: [Int]) throws

@@ -141,6 +141,46 @@ extension Model {
         return streamer.adviseExpertCachePlanMisses(plan.cachePlan)
     }
 
+    /// Page-rounded streamer slot size; the prefill staging arena lays its
+    /// slots on this boundary.
+    func routedExpertStagingSlotSize(layer: Int) throws -> Int {
+        try ensureLayerOpened(layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        return streamer.slotLayoutSize
+    }
+
+    /// Reads the union of a chunked prefill's routed experts for `layer` into
+    /// `arena` in one high-concurrency burst, returning a view per expert in
+    /// the order given. Reads straight from the file even when the decode cache
+    /// already holds some experts: a cache hit lives in a different slot and
+    /// copying it would cost host bandwidth without saving a cold SSD read.
+    func stageRoutedExperts(layer: Int,
+                            experts: [Int],
+                            into arena: PrefillExpertStagingArena) async throws -> [TensorView] {
+        try ensureLayerOpened(layer)
+        guard experts.allSatisfy({ $0 >= 0 && $0 < arena.capacity }) else {
+            throw PrefillGroupedRoutedMoEError.invalidStreamedTileBinding(
+                "staged expert id is outside the arena's per-expert slots")
+        }
+        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let stride = Int(streamer.layout.expertStride)
+        let destinations = experts.map { arena.destinationPointer(forExpert: $0) }
+        nonisolated(unsafe) let destinationPointers = destinations
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try streamer.readExperts(experts: experts,
+                                             into: destinationPointers)
+                    continuation.resume(returning: experts.map {
+                        arena.view(layer: layer, expert: $0, length: stride)
+                    })
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     public func fetchRoutedExperts(plan: RoutedExpertFetchPlan) async throws -> [TensorView] {
         try ensureLayerOpened(plan.layer)
         let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }

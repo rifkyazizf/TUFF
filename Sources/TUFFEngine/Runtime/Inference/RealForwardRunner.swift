@@ -170,6 +170,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     /// Difference between Qwen's logical multimodal RoPE position and the
     /// physical KV index. It remains zero for text-only and every Gemma run.
     private var qwenMultimodalRopeDelta: Int32 = 0
+    /// `TUFF_PREFILL_PROFILE=1`: wall-clock split of each chunked prefill by
+    /// its CPU/GPU sync points, printed to stderr per `prefillChunked` call.
+    private static let prefillProfilingEnabled =
+        ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"] == "1"
+    private var prefillProfile = PrefillProfile()
     private let qwenSparseAttention: QwenSparseAttention?
 
     // Prefill kernels. These are initialized once per runner so the chunk path
@@ -1123,6 +1128,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                 writeFinalHead: spanIndex == spans.count - 1)
             onProgress(span.completedCount)
         }
+        if Self.prefillProfilingEnabled {
+            FileHandle.standardError.write(Data(prefillProfile.report().utf8))
+            prefillProfile = PrefillProfile()
+        }
         if outputMode == .greedyIfAvailable, useFusedGreedyHead {
             return PrefillResult(newPosition: startPosition + tokens.count,
                                  seed: .greedyToken(lastGreedyToken))
@@ -1759,7 +1768,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         let blockInput = usesHyperConnections ? scratch.hcMixed : scratch.normed
         let ffnInput = usesHyperConnections ? scratch.hcMixed : scratch.routedX
 
+        let profiling = Self.prefillProfilingEnabled
+        let chunkStart = profiling ? now() : 0
+        defer {
+            if profiling {
+                prefillProfile.add(\.chunkTotal, now() - chunkStart)
+                prefillProfile.chunks += 1
+                prefillProfile.tokens += tokens.count
+            }
+        }
         for L in 0..<cfg.numLayers {
+            let layerStart = profiling ? now() : 0
+            var routeStart: UInt64 = 0
             if cfg.feedForwardKind == .mixtureOfExperts {
                 model.beginOpeningRoutedExpertStreamer(layer: L)
             }
@@ -2359,8 +2379,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                         hiddenStrideElements: UInt32(D))
             }
 
+                    let attnCommit = profiling ? now() : 0
                     cb.commit()
                     try waitForCompletion(cb)
+                    if profiling {
+                        let done = now()
+                        prefillProfile.add(isLinear ? \.linearEncode : \.fullEncode,
+                                           attnCommit - layerStart)
+                        prefillProfile.add(isLinear ? \.linearAttnWait : \.fullAttnWait,
+                                           done - attnCommit)
+                        prefillProfile.add(isLinear ? \.linearAttnGPU : \.fullAttnGPU,
+                                           gpuNanos(cb))
+                        routeStart = done
+                    }
 
                     let routeCount = t * cfg.topKExperts
                     let idPtr = scratch.routeIDs.contents()
@@ -2459,8 +2490,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                         }
                     }
                     }
+                    let sharedCommit = profiling ? now() : 0
                     sharedCB.commit()
                     try waitForCompletion(sharedCB)
+                    if profiling {
+                        let done = now()
+                        prefillProfile.add(\.routeCPUAndSharedEncode, sharedCommit - routeStart)
+                        prefillProfile.add(\.sharedWait, done - sharedCommit)
+                        prefillProfile.add(\.sharedGPU, gpuNanos(sharedCB))
+                    }
 
                     let metadata = try prefillGroupedMoE.makeStreamedMetadataBuffers(
                         device: ctx.device,
@@ -2478,7 +2516,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                         guard !pendingTiles.isEmpty else { return }
                         let pending = pendingTiles.removeFirst()
                         try withExtendedLifetime((pending.fetch, pending.argumentBuffer)) {
+                            let waitStart = profiling ? now() : 0
                             try waitForCompletion(pending.commandBuffer)
+                            if profiling {
+                                prefillProfile.add(\.tileWait, now() - waitStart)
+                                prefillProfile.add(\.tileGPU, gpuNanos(pending.commandBuffer))
+                            }
                         }
                         if !pending.fetch.plannedMissSlots.isEmpty {
                             try tileLifetime.complete(tileIndex: pending.tileIndex)
@@ -2547,6 +2590,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                     detail: "routed tile scheduler requested pending action without pending tile")
                             }
                         }
+                        let fetchStart = profiling ? now() : 0
                         let fetch = try await PrefillStreamedTileBinding.fetchBindingForTile(
                             model: model,
                             layer: L,
@@ -2554,6 +2598,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                             routes: routes,
                             plannedFetch: plannedFetch,
                             avoidingSlots: Set(pendingTiles.flatMap(\.fetch.plannedAssignedSlots)))
+                        if profiling {
+                            prefillProfile.add(\.expertFetch, now() - fetchStart)
+                            prefillProfile.tiles += 1
+                            prefillProfile.expertsMissed += fetch.plannedMissSlots.count
+                            prefillProfile.expertsUsed += expertIDs.count
+                        }
                         recordSpeculativeFetch(layer: L, fetch: fetch)
                         try fetch.binding.validateCoversPairs(routes.sortedPairs,
                                                               pairStart: Int(tile.pairStart),
@@ -2656,9 +2706,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                                        delta: scratch.h2,
                                                        count: t * D)
                     }
+                    let tailCommit = profiling ? now() : 0
                     tailCB.commit()
                     try withExtendedLifetime(metadata) {
                         try waitForCompletion(tailCB)
+                    }
+                    if profiling {
+                        let done = now()
+                        prefillProfile.add(\.tailWait, done - tailCommit)
+                        prefillProfile.add(isLinear ? \.linearLayerTotal : \.fullLayerTotal,
+                                           done - layerStart)
                     }
                     if let sink = debugChunkLayerSink {
                         sink(L, try readChunkResidualTail(scratch: scratch,
@@ -2761,8 +2818,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                                  vocab: UInt32(cfg.vocabSize),
                                                  rmsEps: eps)
             }
+            let headCommit = profiling ? now() : 0
             finalCB.commit()
             try waitForCompletion(finalCB)
+            if profiling { prefillProfile.add(\.headWait, now() - headCommit) }
             if speculativeTargetTokens == nil,
                outputMode == .greedyIfAvailable, useFusedGreedyHead {
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)

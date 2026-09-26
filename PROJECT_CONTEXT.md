@@ -36,6 +36,7 @@ generated.
 | `--systemone-system-prompt <text>` | none | Used when a request sends no `system` |
 | `--systemone-prefix-reuse on\|off` | on | Shared-prefix checkpoint path |
 | `--prefill-expert-staging on\|off` | on | Burst-read a layer's routed experts into a staging arena during prefill |
+| `--prefill-fetch-overlap on\|off` | on | With staging, run the shared expert and already-staged tiles on the GPU while later sub-bursts are read |
 
 `--expert-cache-slots` accepts 4–128 (help text still says 8–32).
 
@@ -64,10 +65,12 @@ Models on the Mac mini, all qwen36-family 35B-A3B, text-only (no vision pack): `
 
 - Smoke suite: 42/42 on Apodex. Answers are deterministic and option-order stable; multi-question answers
   match single-question ones.
-- Latency on the Mac mini (Apodex, warm OS file cache): 1 question ≈ 1.9 s, 5 questions on one state ≈ 4.6 s.
+- Latency on the Mac mini (Apodex, warm OS file cache): 1 question ≈ 1.55 s, 5 questions on one state ≈ 3.9–4.5 s.
   First request after start ≈ 9 s (cold SSD).
-- Profile of a warm question: routed-expert reads were 65–80% of prefill before staging; now ~30%. GDN layers
-  cost ~250 ms of GPU time per prefill call regardless of length.
+- Profile of a warm prefill: staged expert copies from the OS file cache ≈ 40% (now overlapped with GPU work),
+  GPU ≈ 45%, sync/CPU ≈ 7%. GDN layers cost ~110–160 ms of GPU time per prefill call regardless of length.
+- Tried and dropped: layer-major multi-question prefill (65% fewer expert reads, but no latency gain once reads
+  came from the file cache; extra per-layer syncs cancelled it). Expert cache above ~48 slots is slower.
 
 ## Known issues
 
@@ -80,6 +83,6 @@ Models on the Mac mini, all qwen36-family 35B-A3B, text-only (no vision pack): `
 
 ## Next
 
-1. Run all of a request's questions together one layer at a time, so each routed expert is read once per request.
-2. Investigate the fixed ~250 ms GDN prefill cost (chunkwise GDN kernel).
+1. Experiment: zero-copy expert binding (GPU reads file-cache pages via mmap) to remove the staging copy.
+2. Investigate the fixed GDN prefill cost (chunkwise GDN kernel).
 3. Temperature calibration on labelled data.

@@ -16,6 +16,7 @@ public struct ServerArguments: Equatable, Sendable {
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
     public let prefillExpertStaging: Bool
+    public let prefillFetchOverlap: Bool
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
@@ -53,6 +54,11 @@ public struct ServerArguments: Equatable, Sendable {
                                  union in one staged burst (default on). Off
                                  streams it tile by tile through the decode
                                  expert cache.
+      --prefill-fetch-overlap <on|off>
+                                 With expert staging, overlap the staged reads
+                                 with GPU work so tiles run as their experts
+                                 land (default on). Off reads the whole union
+                                 before running any tile.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --systemone-system-prompt <text>
@@ -94,6 +100,7 @@ public struct ServerArguments: Equatable, Sendable {
             prefillEnabled: prefillPolicy == .chunked,
             prefillChunkTokens: prefillChunkTokens,
             prefillExpertStaging: prefillExpertStaging,
+            prefillFetchOverlap: prefillFetchOverlap,
             forceLogitsHead: forceLogitsHead)
     }
 
@@ -111,6 +118,7 @@ public struct ServerArguments: Equatable, Sendable {
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var prefillExpertStaging = true
+        var prefillFetchOverlap = true
         var rdadvisePolicy = RDAdvicePolicyMode.off
         var systemOneSystemPrompt: String?
         var systemOnePrefixReuse = true
@@ -192,6 +200,14 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid(
                         "--prefill-expert-staging must be on or off")
                 }
+            case "--prefill-fetch-overlap":
+                switch value {
+                case "on": prefillFetchOverlap = true
+                case "off": prefillFetchOverlap = false
+                default:
+                    throw ServerArgumentError.invalid(
+                        "--prefill-fetch-overlap must be on or off")
+                }
             case "--systemone-system-prompt":
                 guard !value.isEmpty else {
                     throw ServerArgumentError.invalid(
@@ -228,6 +244,7 @@ public struct ServerArguments: Equatable, Sendable {
                                prefillPolicy: prefillPolicy,
                                prefillChunkTokens: prefillChunkTokens,
                                prefillExpertStaging: prefillExpertStaging,
+                               prefillFetchOverlap: prefillFetchOverlap,
                                rdadvisePolicy: rdadvisePolicy,
                                visionPack: visionPack,
                                visionResidency: visionResidency,

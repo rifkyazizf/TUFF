@@ -848,6 +848,7 @@ struct ServerArgumentTests {
         ["--prefill", "maybe"],
         ["--prefill-chunk-tokens", "512"],
         ["--prefill-expert-staging", "maybe"],
+        ["--prefill-fetch-overlap", "maybe"],
         ["--rdadvise", "eager"],
     ])
     func rejectsUnsupportedRuntimeValues(flag: [String]) throws {
@@ -875,6 +876,27 @@ struct ServerArgumentTests {
             "--prefill-expert-staging", "on",
         ])
         #expect(on.prefillExpertStaging)
+    }
+
+    @Test func prefillFetchOverlapFlagReachesTheResolvedConfiguration() throws {
+        let defaults = try ServerArguments.parse(["--model", "model.gturbo"])
+        #expect(defaults.prefillFetchOverlap)
+        let defaultConfiguration = try defaults.resolvedRuntimeConfiguration()
+        #expect(defaultConfiguration.prefillFetchOverlap)
+
+        let off = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--prefill-fetch-overlap", "off",
+        ])
+        #expect(!off.prefillFetchOverlap)
+        let offConfiguration = try off.resolvedRuntimeConfiguration()
+        #expect(!offConfiguration.prefillFetchOverlap)
+
+        let on = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--prefill-fetch-overlap", "on",
+        ])
+        #expect(on.prefillFetchOverlap)
     }
     @Test func imageDataURLPreservesOrderedMultimodalParts() throws {
         let dataURL = "data:image/png;base64,iVBORw0KGgo="

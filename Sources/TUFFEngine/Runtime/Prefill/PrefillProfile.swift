@@ -18,6 +18,9 @@ struct PrefillProfile {
     var expertFetch: UInt64 = 0
     var tileWait: UInt64 = 0
     var tileGPU: UInt64 = 0
+    /// CPU time blocked on GPU work (shared expert + tile drains) while fetch
+    /// overlap is on. Small next to `expertFetch` shows the two overlapped.
+    var overlapWait: UInt64 = 0
     var tailWait: UInt64 = 0
     var headWait: UInt64 = 0
     var chunkTotal: UInt64 = 0
@@ -50,6 +53,8 @@ struct PrefillProfile {
         s += "    expert fetch (SSD/cache)\(ms(expertFetch))\(pct(expertFetch))  "
         s += "\(expertsMissed) missed / \(expertsUsed) used in \(tiles) tiles\n"
         s += "    tile GPU wait           \(ms(tileWait))\(pct(tileWait))  gpu \(ms(tileGPU))\n"
+        s += "    overlap wait (shared+tiles)\(ms(overlapWait))\(pct(overlapWait))  "
+        s += "cpu blocked on GPU while fetch runs\n"
         s += "  layer tail                \(ms(tailWait))\(pct(tailWait))\n"
         s += "  LM head                   \(ms(headWait))\(pct(headWait))\n"
         return s

@@ -190,6 +190,56 @@ import Metal
         #expect(stagedMulti == streamedMulti)
     }
 
+    /// Fetch overlap only changes when the staged reads run relative to GPU
+    /// work, so an overlapped chunked prefill must produce byte-identical
+    /// logits to the pre-overlap staging path — single chunk and across a chunk
+    /// boundary. Exercises the deferred shared-expert wait and the burst driver.
+    @Test func prefillFetchOverlap_matchesSerialStagingLogits() async throws {
+        let dir = try QwenToySynthetic.write()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ctx = try MetalContext()
+
+        func prefillBytes(overlap: Bool,
+                          tokens: [Int32],
+                          chunkTokens: Int) async throws -> [UInt8] {
+            let model = try Model.load(directoryURL: dir,
+                                       device: ctx.device,
+                                       expecting: .qwen36Toy())
+            let runner = try RealForwardRunner(
+                model: model,
+                context: ctx,
+                maxContext: 64,
+                runtimeConfiguration: RuntimeConfiguration(
+                    prefillExpertStaging: true,
+                    prefillFetchOverlap: overlap))
+            let logits = try makeLogits(ctx, vocab: 1024)
+            let result = try await runner.prefillChunked(
+                tokens: tokens[...],
+                startPosition: 0,
+                outputMode: .logits,
+                config: .production(chunkTokens: chunkTokens),
+                into: logits,
+                onProgress: { _ in })
+            #expect(result.newPosition == tokens.count)
+            return Array(UnsafeRawBufferPointer(start: logits.contents(),
+                                                count: logits.length))
+        }
+
+        let singleChunk: [Int32] = Array(1...16)
+        let overlappedSingle = try await prefillBytes(overlap: true, tokens: singleChunk,
+                                                      chunkTokens: 32)
+        let serialSingle = try await prefillBytes(overlap: false, tokens: singleChunk,
+                                                  chunkTokens: 32)
+        #expect(overlappedSingle == serialSingle)
+
+        let multiChunk: [Int32] = Array(1...40)
+        let overlappedMulti = try await prefillBytes(overlap: true, tokens: multiChunk,
+                                                     chunkTokens: 32)
+        let serialMulti = try await prefillBytes(overlap: false, tokens: multiChunk,
+                                                 chunkTokens: 32)
+        #expect(overlappedMulti == serialMulti)
+    }
+
     /// (b) KV manager + GDN state manager interplay under the qwen mask:
     /// linear layers carry no per-token KV storage, full layers are linear
     /// append-only, and reset() returns both to the empty-context state.

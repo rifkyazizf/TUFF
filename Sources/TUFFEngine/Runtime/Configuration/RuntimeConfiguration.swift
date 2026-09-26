@@ -50,6 +50,11 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     /// a dedicated arena in one burst instead of streaming it tile by tile
     /// through the decode expert cache.
     public let prefillExpertStaging: Bool
+    /// With `prefillExpertStaging`, overlap the staged read with the GPU: the
+    /// shared expert runs while the read starts, and each sub-burst's tiles
+    /// commit as soon as their experts land while the next sub-burst is read.
+    /// Off reproduces the pre-overlap staging path exactly.
+    public let prefillFetchOverlap: Bool
     public let headPath: RuntimeHeadPath
 
     public init(expertCacheSlots: Int = 16,
@@ -59,6 +64,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 prefillChunkTokens: Int = 128,
                 prefillAttentionPath: RuntimePrefillAttentionPath = .fullTensorOps2DPreferred,
                 prefillExpertStaging: Bool = true,
+                prefillFetchOverlap: Bool = true,
                 forceLogitsHead: Bool = false) {
         precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),
                      "unsupported expert-cache slot count")
@@ -71,6 +77,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
         self.prefillChunkTokens = prefillChunkTokens
         self.prefillAttentionPath = prefillAttentionPath
         self.prefillExpertStaging = prefillExpertStaging
+        self.prefillFetchOverlap = prefillFetchOverlap
         self.headPath = forceLogitsHead ? .logits : .fusedRows
     }
 

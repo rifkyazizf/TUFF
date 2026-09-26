@@ -335,6 +335,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let useFusedGreedyHead: Bool
     private let prefillAttentionPath: RuntimePrefillAttentionPath
     private let prefillExpertStagingEnabled: Bool
+    private let prefillFetchOverlapEnabled: Bool
+    /// Experts per staging sub-burst. Sized to fill the streamer's 32-deep read
+    /// pool (a tile is only eight experts) while the burst's tiles run on GPU.
+    private static let prefillStagingBurstExperts = 32
+    /// The overlap path needs staged prefill; with staging off there is no
+    /// fetch to hide behind GPU work.
+    private var prefillFetchOverlapActive: Bool {
+        prefillExpertStagingEnabled && prefillFetchOverlapEnabled
+    }
     public let rdadviseEnabled: Bool
     public let rdadvisePolicyMode: RDAdvicePolicyMode
     private var rdadviseSkipUntilPosition: Int = -1
@@ -366,6 +375,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             && !config.hyperConnection.isEnabled
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         self.prefillExpertStagingEnabled = runtimeConfiguration.prefillExpertStaging
+        self.prefillFetchOverlapEnabled = runtimeConfiguration.prefillFetchOverlap
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
         self.rdadvisePolicyMode = runtimeConfiguration.rdadvisePolicy
         self.rdadviseAdaptiveState = RDAdviceAdaptivePolicyState(
@@ -2509,12 +2519,30 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                     }
                     let sharedCommit = profiling ? now() : 0
                     sharedCB.commit()
-                    try waitForCompletion(sharedCB)
                     if profiling {
-                        let done = now()
                         prefillProfile.add(\.routeCPUAndSharedEncode, sharedCommit - routeStart)
-                        prefillProfile.add(\.sharedWait, done - sharedCommit)
-                        prefillProfile.add(\.sharedGPU, gpuNanos(sharedCB))
+                    }
+                    // With overlap the shared expert runs while the staging read
+                    // starts; nothing before the tail reads `scratch.h1`, so the
+                    // wait slides to just before the tail. Without it, wait now
+                    // exactly as before.
+                    var sharedWaited = false
+                    func waitForSharedExpert() throws {
+                        guard !sharedWaited else { return }
+                        sharedWaited = true
+                        let waitStart = profiling ? now() : 0
+                        try waitForCompletion(sharedCB)
+                        if profiling {
+                            let waited = now() - waitStart
+                            prefillProfile.add(\.sharedWait, waited)
+                            prefillProfile.add(\.sharedGPU, gpuNanos(sharedCB))
+                            if prefillFetchOverlapActive {
+                                prefillProfile.add(\.overlapWait, waited)
+                            }
+                        }
+                    }
+                    if !prefillFetchOverlapActive {
+                        try waitForSharedExpert()
                     }
 
                     let metadata = try prefillGroupedMoE.makeStreamedMetadataBuffers(
@@ -2536,8 +2564,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                             let waitStart = profiling ? now() : 0
                             try waitForCompletion(pending.commandBuffer)
                             if profiling {
-                                prefillProfile.add(\.tileWait, now() - waitStart)
+                                let waited = now() - waitStart
+                                prefillProfile.add(\.tileWait, waited)
                                 prefillProfile.add(\.tileGPU, gpuNanos(pending.commandBuffer))
+                                if prefillFetchOverlapActive {
+                                    prefillProfile.add(\.overlapWait, waited)
+                                }
                             }
                         }
                         if !pending.fetch.plannedMissSlots.isEmpty {
@@ -2593,27 +2625,24 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                     }
 
                     if prefillExpertStagingEnabled {
-                        // Read the layer's whole routed union in one burst, then
-                        // run every tile back-to-back off the shared arena: no
-                        // per-tile fetch wait, and SSD queue depth comes from the
-                        // read pool instead of one tile's eight experts.
+                        // Read the layer's routed union into the shared arena:
+                        // no per-tile fetch wait, and SSD queue depth comes from
+                        // the read pool instead of one tile's eight experts.
                         let union = routes.groups.map { Int($0.expert) }
-                        let arena = try prefillExpertStagingArena()
-                        let burstStart = profiling ? now() : 0
-                        let stagedViews = try await model.stageRoutedExperts(
-                            layer: L, experts: union, into: arena)
-                        if profiling {
-                            prefillProfile.add(\.expertFetch, now() - burstStart)
-                            prefillProfile.expertsMissed += union.count
+                        let tileExpertIDs = try routes.tiles.indices.map {
+                            try PrefillStreamedTileBinding.expertIDs(forTile: $0, routes: routes)
                         }
+                        let arena = try prefillExpertStagingArena()
                         var viewByExpert: [Int: TensorView] = [:]
                         viewByExpert.reserveCapacity(union.count)
-                        for (expert, view) in zip(union, stagedViews) {
-                            viewByExpert[expert] = view
+
+                        func recordStaged(_ experts: [Int], _ views: [TensorView]) {
+                            for (expert, view) in zip(experts, views) {
+                                viewByExpert[expert] = view
+                            }
                         }
-                        for (tileIndex, tile) in routes.tiles.enumerated() {
-                            let expertIDs = try PrefillStreamedTileBinding.expertIDs(
-                                forTile: tileIndex, routes: routes)
+                        func encodeStagedTile(_ tileIndex: Int) throws {
+                            let expertIDs = tileExpertIDs[tileIndex]
                             let views = try expertIDs.map { expert -> TensorView in
                                 guard let view = viewByExpert[expert] else {
                                     throw PrefillGroupedRoutedMoEError.invalidStreamedTileBinding(
@@ -2627,7 +2656,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                             }
                             try encodePendingTile(
                                 tileIndex: tileIndex,
-                                tile: tile,
+                                tile: routes.tiles[tileIndex],
                                 fetch: PrefillStreamedTileFetchResult(
                                     expertIDs: expertIDs,
                                     binding: PrefillStreamedTileBinding(expertIDs: expertIDs,
@@ -2637,6 +2666,63 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                     plannedMissIndices: [],
                                     plannedAssignedSlots: [],
                                     plannedMissSlots: []))
+                        }
+
+                        let stager = try model.prefillExpertStager(layer: L, into: arena)
+                        if prefillFetchOverlapActive {
+                            typealias BurstRead = ([Int], [TensorView], UInt64)
+                            func startBurst(_ tileRange: Range<Int>) -> Task<BurstRead, Error> {
+                                let experts = tileRange.flatMap { tileExpertIDs[$0] }
+                                return Task {
+                                    let readStart = now()
+                                    let views = try await stager.stage(experts: experts)
+                                    return (experts, views, now() - readStart)
+                                }
+                            }
+                            let bursts = PrefillStagingBurst.tileRanges(
+                                expertCounts: routes.tiles.map { Int($0.groupCount) },
+                                burstExperts: Self.prefillStagingBurstExperts)
+                            if let firstBurst = bursts.first {
+                                var inFlight = startBurst(firstBurst)
+                                do {
+                                    for (burstIndex, tileRange) in bursts.enumerated() {
+                                        let (experts, views, readNanos) = try await inFlight.value
+                                        recordStaged(experts, views)
+                                        if profiling {
+                                            prefillProfile.add(\.expertFetch, readNanos)
+                                            prefillProfile.expertsMissed += experts.count
+                                        }
+                                        // Kick off the next burst's reads before
+                                        // encoding this burst's tiles, so the SSD
+                                        // stays busy while the GPU runs them.
+                                        if burstIndex + 1 < bursts.count {
+                                            inFlight = startBurst(bursts[burstIndex + 1])
+                                        }
+                                        for tileIndex in tileRange {
+                                            try encodeStagedTile(tileIndex)
+                                        }
+                                    }
+                                } catch {
+                                    // A still-reading burst owns arena slots the
+                                    // next layer will reuse; let it finish before
+                                    // unwinding.
+                                    _ = try? await inFlight.value
+                                    throw error
+                                }
+                            }
+                        } else {
+                            // Pre-overlap path: one union burst, then every tile
+                            // back-to-back off the shared arena.
+                            let burstStart = profiling ? now() : 0
+                            let stagedViews = try await stager.stage(experts: union)
+                            if profiling {
+                                prefillProfile.add(\.expertFetch, now() - burstStart)
+                                prefillProfile.expertsMissed += union.count
+                            }
+                            recordStaged(union, stagedViews)
+                            for tileIndex in routes.tiles.indices {
+                                try encodeStagedTile(tileIndex)
+                            }
                         }
                         // Drain before the next layer overwrites the arena.
                         while !pendingTiles.isEmpty {
@@ -2728,6 +2814,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                             try drainOldestPendingTile()
                         }
                     }
+                    // The tail reads the shared expert's `h1` plus the routed
+                    // reduce, so the deferred shared wait lands here.
+                    try waitForSharedExpert()
                     guard let tailCB = makePrefillCommandBuffer() else {
                         throw ModelError.residentBufferWrapFailed
                     }

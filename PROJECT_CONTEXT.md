@@ -71,6 +71,9 @@ Models on the Mac mini, all qwen36-family 35B-A3B, text-only (no vision pack): `
   GPU ≈ 45%, sync/CPU ≈ 7%. GDN layers cost ~110–160 ms of GPU time per prefill call regardless of length.
 - Tried and dropped: layer-major multi-question prefill (65% fewer expert reads, but no latency gain once reads
   came from the file cache; extra per-layer syncs cancelled it). Expert cache above ~48 slots is slower.
+- Tried and dropped: zero-copy experts (mmap + Metal `bytesNoCopy`), per-expert, per-layer and a `mincore` hybrid.
+  Only faster when the exact same experts repeat; with a different expert set per request it is 1.6–14 s vs
+  ~1 s for the copy path, because Metal wiring faults pages in serially and pins memory.
 
 ## Known issues
 
@@ -83,6 +86,5 @@ Models on the Mac mini, all qwen36-family 35B-A3B, text-only (no vision pack): `
 
 ## Next
 
-1. Experiment: zero-copy expert binding (GPU reads file-cache pages via mmap) to remove the staging copy.
-2. Investigate the fixed GDN prefill cost (chunkwise GDN kernel).
-3. Temperature calibration on labelled data.
+1. Investigate the fixed GDN prefill cost (chunkwise GDN kernel).
+2. Temperature calibration on labelled data.

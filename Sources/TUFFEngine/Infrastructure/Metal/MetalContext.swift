@@ -95,6 +95,7 @@ public final class MetalContext: @unchecked Sendable {
         "ngram_ple",
         "fused",
         "prefill",
+        "prefill_int4_mbatch",
         "gdn",
         "vision",
     ]
@@ -112,6 +113,7 @@ public final class MetalContext: @unchecked Sendable {
         "logit": "Metal/Sampling",
         "moe": "Metal/MoE",
         "prefill": "Metal/Prefill",
+        "prefill_int4_mbatch": "Metal/Prefill",
         "hyper_connection": "Metal/Primitives",
         "ngram_ple": "Metal/Primitives",
         "per_layer_embedding": "Metal/Primitives",

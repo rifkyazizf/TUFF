@@ -29,6 +29,16 @@ struct PrefillProfile {
     var tiles = 0
     var expertsUsed = 0
     var expertsMissed = 0
+    /// GPU nanoseconds per Gated-DeltaNet stage, in first-seen order.
+    var stages: [(name: String, nanos: UInt64)] = []
+
+    mutating func addStage(_ name: String, _ nanos: UInt64) {
+        if let index = stages.firstIndex(where: { $0.name == name }) {
+            stages[index].nanos &+= nanos
+        } else {
+            stages.append((name, nanos))
+        }
+    }
 
     mutating func add(_ field: WritableKeyPath<PrefillProfile, UInt64>, _ nanos: UInt64) {
         self[keyPath: field] &+= nanos
@@ -57,6 +67,9 @@ struct PrefillProfile {
         s += "cpu blocked on GPU while fetch runs\n"
         s += "  layer tail                \(ms(tailWait))\(pct(tailWait))\n"
         s += "  LM head                   \(ms(headWait))\(pct(headWait))\n"
+        for stage in stages {
+            s += "  GDN stage \(stage.name.padding(toLength: 24, withPad: " ", startingAt: 0))gpu \(ms(stage.nanos))\n"
+        }
         return s
     }
 }

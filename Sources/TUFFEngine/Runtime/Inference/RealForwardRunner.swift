@@ -173,7 +173,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     /// `TUFF_PREFILL_PROFILE=1`: wall-clock split of each chunked prefill by
     /// its CPU/GPU sync points, printed to stderr per `prefillChunked` call.
     private static let prefillProfilingEnabled =
-        ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"] == "1"
+        ["1", "2"].contains(ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"])
+    /// `TUFF_PREFILL_PROFILE=2` also commits after each Gated-DeltaNet stage to
+    /// time it on the GPU. The extra syncs slow prefill; diagnostics only.
+    private static let prefillGDNStageProfiling =
+        ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"] == "2"
     private var prefillProfile = PrefillProfile()
     private let qwenSparseAttention: QwenSparseAttention?
 
@@ -1846,6 +1850,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                        d: UInt32(D),
                                        eps: eps)
             }
+            func gdnStage(_ name: String) throws {
+                guard Self.prefillGDNStageProfiling, isLinear else { return }
+                cb.commit()
+                try waitForCompletion(cb)
+                prefillProfile.addStage(name, gpuNanos(cb))
+                guard let next = makePrefillCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                cb = next
+            }
+            try gdnStage("input norm")
             if isLinear {
                 // Gated-DeltaNet linear attention over the chunk: batched
                 // projections, causal conv (+ tail carry), delta-rule
@@ -1895,6 +1910,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                      tokenCount: t,
                                      xStrideElements: D,
                                      yStrideElements: la.numVHeads)
+                try gdnStage("in_proj (qkv, z, a, b)")
                 let convW = views.linConv!
                 let tail = gdnState.convTailBuffer(layer: L)
                 gdn.encodeConvPrefill(commandBuffer: cb,
@@ -1911,6 +1927,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                 gdn.encodeQKNorm(commandBuffer: cb,
                                  convOut: scratch.gdnConvOut,
                                  rows: t)
+                try gdnStage("conv + tail + qk norm")
                 let aLog = views.linALog!
                 let dtBias = views.linDtBias!
                 gdn.encodeDeltaStepPrefill(commandBuffer: cb,
@@ -1924,6 +1941,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                            state: gdnState.stateBuffer(layer: L),
                                            y: scratch.gdnY,
                                            rows: t)
+                try gdnStage("delta step")
                 let gatedNormW = views.linNorm!
                 gdn.encodeGatedNorm(commandBuffer: cb,
                                     y: scratch.gdnY,
@@ -1932,6 +1950,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                     weightOffset: Int(gatedNormW.offset),
                                     out: scratch.attentionOutput,
                                     rows: t)
+                try gdnStage("gated norm")
                 encodeInt4Projection(commandBuffer: cb,
                                      family: .o,
                                      weights: views.linOut!,
@@ -1942,6 +1961,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                      tokenCount: t,
                                      xStrideElements: la.valueDim,
                                      yStrideElements: D)
+                try gdnStage("out_proj")
             } else {
                 let qProjRows = cfg.attnOutputGate ? 2 * qDim : qDim
                 encodeInt4Projection(commandBuffer: cb,

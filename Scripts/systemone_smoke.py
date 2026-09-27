@@ -149,6 +149,74 @@ SCORE_CASES = [
      ["terrible", "poor", "average", "good", "excellent"], "average"),
 ]
 
+# The car-wash family shares these two options; case 3 labels the drive option
+# differently so it stands alone.
+WALK_OR_DRIVE = {"walk": "Walk there", "drive": "Drive there"}
+
+# Reasoning traps: cases where the tempting shortcut answer is wrong. These are
+# an eval signal, not a release gate -- main() only lets their failures change
+# the exit code under --strict-tricky. Each row is
+# (name, kind, state, instructions, criteria, expected); for "noul" rows the
+# criteria is None and the expected value is True for yes, False for no.
+TRICKY_CASES = [
+    ("carwash_short", "choice",
+     "I want to wash my car. The car wash is only 50 meters from my house.",
+     "Should I walk or drive to the car wash?", WALK_OR_DRIVE, "drive"),
+    ("carwash_long", "choice",
+     "I want to wash my car. The car wash is 3 kilometers from my house.",
+     "Should I walk or drive to the car wash?", WALK_OR_DRIVE, "drive"),
+    ("fuel_station", "choice",
+     "My car is almost out of fuel. The petrol station is 200 meters away.",
+     "How should I get to the petrol station?",
+     {"walk": "Walk there", "drive": "Drive the car there"}, "drive"),
+    ("oil_change", "choice",
+     "I want to get my car's oil changed. The garage is right next door.",
+     "Should I walk or drive to the garage?", WALK_OR_DRIVE, "drive"),
+    ("barber_control", "choice",
+     "I want a haircut. The barber shop is 100 meters from my house.",
+     "Should I walk or drive to the barber shop?", WALK_OR_DRIVE, "walk"),
+    ("bakery_control", "choice",
+     "I want to buy bread. The bakery is 50 meters from my house and I don't "
+     "need to bring anything.",
+     "Should I walk or drive to the bakery?", WALK_OR_DRIVE, "walk"),
+    ("order_deploy", "choice",
+     "I want to deploy the new version to production, but before that I need to "
+     "run the database migration.",
+     "What is the next action?",
+     {"migrate": "Run the database migration",
+      "deploy": "Deploy the new version to production"}, "migrate"),
+    ("order_invoices", "choice",
+     "I want to cancel my subscription, but before that I want to download all "
+     "my invoices.",
+     "What does the customer want to do first?",
+     {"invoices": "Download all invoices", "cancel": "Cancel the subscription"},
+     "invoices"),
+    ("order_cake", "choice",
+     "I'd like to bake a cake, but first I have to go and buy eggs.",
+     "What should I do next?",
+     {"buy_eggs": "Buy eggs", "bake": "Bake the cake"}, "buy_eggs"),
+    ("order_password", "choice",
+     "Before I reset my password I need to update my recovery email address.",
+     "Which step comes first?",
+     {"recovery_email": "Update the recovery email",
+      "reset_password": "Reset the password"}, "recovery_email"),
+    ("order_ready_noul", "noul",
+     "I want to transfer money to my friend, but before that I need to verify "
+     "my identity.",
+     "Is the user ready to make the transfer right now?", None, False),
+    ("order_done_noul", "noul",
+     "I already verified my identity, so now I want to transfer money to my "
+     "friend.",
+     "Is the user ready to make the transfer right now?", None, True),
+    ("retracted_intent", "choice",
+     "Please ignore my earlier question about billing. My real problem is that "
+     "the app crashes every time I log in.",
+     "Which team should handle this?", TICKETS, "technical"),
+    ("negated_request", "noul",
+     "I don't want a refund, I just want the item replaced with the right size.",
+     "Does the customer ask for a refund?", None, False),
+]
+
 MULTI_STATE = (
     "I was charged twice for the subscription and now the app will not let me log "
     "in. This is the second time I have contacted support and I am losing patience."
@@ -353,6 +421,42 @@ def run_choice_cases(runner):
             problems.append("expected %r, got %r" % (expected, answer.get("choice")))
         runner.record(name, expected, answer.get("choice", "-"),
                       "%.4f" % answer.get("confidence", 0.0), elapsed, problems)
+
+
+def run_tricky_cases(runner):
+    """Reasoning traps. An eval signal, not a release gate: main() only lets
+    these failures change the exit code under --strict-tricky."""
+    for name, kind, state, instructions, criteria, expected in TRICKY_CASES:
+        try:
+            if kind == "choice":
+                answer, _, elapsed = runner.ask(
+                    state, {"type": "choice", "instructions": instructions,
+                            "criteria": criteria})
+            else:
+                answer, _, elapsed = runner.ask(
+                    state, {"type": "noul", "instructions": instructions})
+        except SmokeError as error:
+            runner.fail(name, expected, "error", str(error))
+            continue
+        # The "tricky:" prefix keeps these answers distinct in --dump, so
+        # --compare covers them alongside the other groups.
+        runner.capture("tricky:%s" % name, answer)
+        if kind == "choice":
+            problems = invariant_problems(answer, option_keys=list(criteria))
+            if answer.get("choice") != expected:
+                problems.append("expected %r, got %r"
+                                % (expected, answer.get("choice")))
+            runner.record(name, expected, answer.get("choice", "-"),
+                          "%.4f" % answer.get("confidence", 0.0), elapsed, problems)
+        else:
+            probability = answer["noul"]
+            want = "yes" if expected else "no"
+            got = "yes" if probability > 0.5 else "no"
+            problems = invariant_problems(answer)
+            if got != want:
+                problems.append("expected %s (noul %s 0.5), got %.4f"
+                                % (want, ">" if expected else "<", probability))
+            runner.record(name, want, got, "%.4f" % probability, elapsed, problems)
 
 
 def run_score_cases(runner):
@@ -642,6 +746,10 @@ def main():
                         help="write every successful answer to FILE as JSON")
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"), default=None,
                         help="compare two --dump files; no server needed")
+    parser.add_argument("--strict-tricky", action="store_true",
+                        help="let tricky (reasoning trap) failures fail the run")
+    parser.add_argument("--only-tricky", action="store_true",
+                        help="run only the tricky (reasoning traps) group")
     arguments = parser.parse_args()
 
     if arguments.compare:
@@ -656,24 +764,42 @@ def main():
 
     print("systemone smoke: http://127.0.0.1:%d model=%s" % (arguments.port, model))
     runner = Runner(arguments.port, model)
-    run_noul_cases(runner)
-    run_choice_cases(runner)
-    run_score_cases(runner)
-    run_multi_question(runner)
-    run_determinism(runner)
-    run_option_order(runner)
-    run_system_field(runner)
-    run_error_cases(runner)
+    tricky = Runner(arguments.port, model)
+    if not arguments.only_tricky:
+        run_noul_cases(runner)
+        run_choice_cases(runner)
+        run_score_cases(runner)
+        run_multi_question(runner)
+        run_determinism(runner)
+        run_option_order(runner)
+        run_system_field(runner)
+        run_error_cases(runner)
+
+    run_tricky_cases(tricky)
+
+    if not arguments.only_tricky:
+        print()
+        print_table(runner)
+        passed = sum(1 for row in runner.rows if row[0])
+        print()
+        print("%d passed, %d failed" % (passed, len(runner.rows) - passed))
 
     print()
-    print_table(runner)
-    passed = sum(1 for row in runner.rows if row[0])
+    print("tricky (reasoning traps)")
+    print_table(tricky)
+    tricky_passed = sum(1 for row in tricky.rows if row[0])
     print()
-    print("%d passed, %d failed" % (passed, len(runner.rows) - passed))
+    print("tricky: %d/%d passed" % (tricky_passed, len(tricky.rows)))
+
+    dumps = dict(runner.dumps)
+    dumps.update(tricky.dumps)
     if arguments.dump:
-        write_dump(arguments.dump, runner.dumps)
-        print("dumped %d answers to %s" % (len(runner.dumps), arguments.dump))
-    return 0 if not runner.failures else 1
+        write_dump(arguments.dump, dumps)
+        print("dumped %d answers to %s" % (len(dumps), arguments.dump))
+    failures = list(runner.failures)
+    if arguments.strict_tricky:
+        failures += tricky.failures
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

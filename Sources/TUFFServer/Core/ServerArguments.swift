@@ -17,6 +17,7 @@ public struct ServerArguments: Equatable, Sendable {
     public let prefillChunkTokens: Int
     public let prefillExpertStaging: Bool
     public let prefillFetchOverlap: Bool
+    public let prefillMBatchInt4: Bool
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
@@ -59,6 +60,10 @@ public struct ServerArguments: Equatable, Sendable {
                                  with GPU work so tiles run as their experts
                                  land (default on). Off reads the whole union
                                  before running any tile.
+      --prefill-mbatch-int4 <on|off>
+                                 Use the batched small-M INT4 kernel for wide
+                                 chunked-prefill projections (default off: ~8%
+                                 faster, but probabilities shift up to ~0.06).
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --systemone-system-prompt <text>
@@ -101,6 +106,7 @@ public struct ServerArguments: Equatable, Sendable {
             prefillChunkTokens: prefillChunkTokens,
             prefillExpertStaging: prefillExpertStaging,
             prefillFetchOverlap: prefillFetchOverlap,
+            prefillMBatchInt4: prefillMBatchInt4,
             forceLogitsHead: forceLogitsHead)
     }
 
@@ -119,6 +125,7 @@ public struct ServerArguments: Equatable, Sendable {
         var prefillChunkTokens = 128
         var prefillExpertStaging = true
         var prefillFetchOverlap = true
+        var prefillMBatchInt4 = false
         var rdadvisePolicy = RDAdvicePolicyMode.off
         var systemOneSystemPrompt: String?
         var systemOnePrefixReuse = true
@@ -208,6 +215,14 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid(
                         "--prefill-fetch-overlap must be on or off")
                 }
+            case "--prefill-mbatch-int4":
+                switch value {
+                case "on": prefillMBatchInt4 = true
+                case "off": prefillMBatchInt4 = false
+                default:
+                    throw ServerArgumentError.invalid(
+                        "--prefill-mbatch-int4 must be on or off")
+                }
             case "--systemone-system-prompt":
                 guard !value.isEmpty else {
                     throw ServerArgumentError.invalid(
@@ -245,6 +260,7 @@ public struct ServerArguments: Equatable, Sendable {
                                prefillChunkTokens: prefillChunkTokens,
                                prefillExpertStaging: prefillExpertStaging,
                                prefillFetchOverlap: prefillFetchOverlap,
+                               prefillMBatchInt4: prefillMBatchInt4,
                                rdadvisePolicy: rdadvisePolicy,
                                visionPack: visionPack,
                                visionResidency: visionResidency,

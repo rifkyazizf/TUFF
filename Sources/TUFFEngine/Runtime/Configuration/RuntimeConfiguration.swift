@@ -55,6 +55,15 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     /// commit as soon as their experts land while the next sub-burst is read.
     /// Off reproduces the pre-overlap staging path exactly.
     public let prefillFetchOverlap: Bool
+    /// Dispatch eligible chunked-prefill INT4 projections to
+    /// `PrefillInt4MBatchQMM`, which reads every weight tile once and reuses it
+    /// for all token rows. Off keeps the per-family MPP/qmm/GEMV choice.
+    public let prefillMBatchInt4: Bool
+    /// Output width (`rows`) below which the batched kernel's single
+    /// threadgroup cannot amortize its weight read, so the wide-N kernels stay
+    /// in charge. `nil` uses `PrefillProjectionDispatchPolicy.mbatchMinimumRows`;
+    /// tests lower it to reach toy projections.
+    public let prefillMBatchMinimumRows: Int?
     public let headPath: RuntimeHeadPath
 
     public init(expertCacheSlots: Int = 16,
@@ -65,6 +74,8 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 prefillAttentionPath: RuntimePrefillAttentionPath = .fullTensorOps2DPreferred,
                 prefillExpertStaging: Bool = true,
                 prefillFetchOverlap: Bool = true,
+                prefillMBatchInt4: Bool = false,
+                prefillMBatchMinimumRows: Int? = nil,
                 forceLogitsHead: Bool = false) {
         precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),
                      "unsupported expert-cache slot count")
@@ -78,6 +89,8 @@ public struct RuntimeConfiguration: Sendable, Equatable {
         self.prefillAttentionPath = prefillAttentionPath
         self.prefillExpertStaging = prefillExpertStaging
         self.prefillFetchOverlap = prefillFetchOverlap
+        self.prefillMBatchInt4 = prefillMBatchInt4
+        self.prefillMBatchMinimumRows = prefillMBatchMinimumRows
         self.headPath = forceLogitsHead ? .logits : .fusedRows
     }
 

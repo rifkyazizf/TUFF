@@ -36,6 +36,7 @@ generated.
 | `--systemone-system-prompt <text>` | none | Used when a request sends no `system` |
 | `--systemone-prefix-reuse on\|off` | on | Shared-prefix checkpoint path |
 | `--prefill-expert-staging on\|off` | on | Burst-read a layer's routed experts into a staging arena during prefill |
+| `--prefill-mbatch-int4 on\|off` | off | Batched small-M INT4 kernel for wide prefill projections (M ≤ 64): ~8% faster, probabilities shift up to ~0.06 |
 | `--prefill-fetch-overlap on\|off` | on | With staging, run the shared expert and already-staged tiles on the GPU while later sub-bursts are read |
 
 `--expert-cache-slots` accepts 4–128 (help text still says 8–32).
@@ -86,5 +87,8 @@ Models on the Mac mini, all qwen36-family 35B-A3B, text-only (no vision pack): `
 
 ## Next
 
-1. Investigate the fixed GDN prefill cost (chunkwise GDN kernel).
+1. INT4 projection kernels run 6–9× below the M2 Pro's limits at small M (`TUFF_BENCH_INT4=1` benchmark); the
+   batched kernel reaches 2–4× but half-precision weight staging costs answer parity, so it ships off.
 2. Temperature calibration on labelled data.
+3. `Scripts/systemone_smoke.py` also runs 14 reasoning-trap cases (car-wash, step-ordering, retraction); Apodex
+   passes 11/14 (fails car-wash at 50 m with 0.94 confidence, oil change, and one ambiguous control).

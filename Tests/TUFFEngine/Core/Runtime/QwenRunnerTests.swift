@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import Metal
+import TUFFValidationSupport
 @testable import TUFFEngine
 
 /// Qwen 3.6 runtime integration: runner construction against the qwen toy
@@ -238,6 +239,63 @@ import Metal
         let serialMulti = try await prefillBytes(overlap: false, tokens: multiChunk,
                                                  chunkTokens: 32)
         #expect(overlappedMulti == serialMulti)
+    }
+
+    /// The batched small-M kernel reads each weight tile once for all token
+    /// rows instead of once per row, so an eligible projection must land the
+    /// same logits as the per-family MPP/qmm/GEMV dispatch. Every toy
+    /// projection is narrower than the production 512-column floor, so the
+    /// floor drops to 32 to reach them. Single chunk and across a chunk
+    /// boundary; identical argmax, and the batched kernel must actually have
+    /// encoded.
+    @Test func prefillMBatchInt4_matchesPerFamilyDispatchLogits() async throws {
+        let dir = try QwenToySynthetic.write()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ctx = try MetalContext()
+        let vocab = 1024
+
+        func prefill(mbatch: Bool,
+                     tokens: [Int32],
+                     chunkTokens: Int) async throws -> (logits: [Float], dispatches: Int) {
+            let model = try Model.load(directoryURL: dir,
+                                       device: ctx.device,
+                                       expecting: .qwen36Toy())
+            let runner = try RealForwardRunner(
+                model: model,
+                context: ctx,
+                maxContext: 64,
+                runtimeConfiguration: RuntimeConfiguration(
+                    prefillMBatchInt4: mbatch,
+                    prefillMBatchMinimumRows: 32))
+            let logits = try makeLogits(ctx, vocab: vocab)
+            let result = try await runner.prefillChunked(
+                tokens: tokens[...],
+                startPosition: 0,
+                outputMode: .logits,
+                config: .production(chunkTokens: chunkTokens),
+                into: logits,
+                onProgress: { _ in })
+            #expect(result.newPosition == tokens.count)
+            return (Fp16Buffer.read(logits, count: vocab),
+                    runner.prefillMBatchInt4Dispatches)
+        }
+
+        func check(tokens: [Int32], chunkTokens: Int, label: String) async throws {
+            let on = try await prefill(mbatch: true, tokens: tokens,
+                                       chunkTokens: chunkTokens)
+            let off = try await prefill(mbatch: false, tokens: tokens,
+                                        chunkTokens: chunkTokens)
+            #expect(on.dispatches > 0, "\(label): batched kernel never ran")
+            #expect(off.dispatches == 0, "\(label): disabled path dispatched the batched kernel")
+            let relErr = RelError.compute(actual: on.logits, reference: off.logits)
+            #expect(relErr <= 1e-2, "\(label): relErr=\(relErr)")
+            let onArgmax = on.logits.enumerated().max(by: { $0.element < $1.element })!.offset
+            let offArgmax = off.logits.enumerated().max(by: { $0.element < $1.element })!.offset
+            #expect(onArgmax == offArgmax, "\(label): argmax \(onArgmax) != \(offArgmax)")
+        }
+
+        try await check(tokens: Array(1...16), chunkTokens: 32, label: "single-chunk")
+        try await check(tokens: Array(1...40), chunkTokens: 32, label: "multi-chunk")
     }
 
     /// (b) KV manager + GDN state manager interplay under the qwen mask:

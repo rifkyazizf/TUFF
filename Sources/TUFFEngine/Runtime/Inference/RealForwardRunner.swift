@@ -116,6 +116,12 @@ internal enum PrefillProjectionDispatch: Sendable, Equatable {
 }
 
 internal enum PrefillProjectionDispatchPolicy {
+    /// Narrowest output (`rows`) the batched small-M kernel is worth using for.
+    /// Below it a single threadgroup's weight tile is too small to amortize its
+    /// read over the token rows, so qmm/GEMV is at least as fast. The M2 Pro
+    /// benchmark crossover is around 512 columns.
+    static let mbatchMinimumRows = 512
+
     static func selectedDispatch(for family: PrefillProjectionFamily,
                                  chunkTokens: Int) -> PrefillProjectionDispatch {
         guard chunkTokens >= 32 else {
@@ -187,6 +193,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let prefillHyperConnection: PrefillHyperConnection?
     private let prefillRMS: PrefillRMSNorm
     private let prefillQMM: PrefillInt4QMM
+    private let prefillMBatchQMM: PrefillInt4MBatchQMM?
     private let prefillMPPAffineInt4: MPPPrefillInt4QMM?
     private let prefillQKVEpilogue: PrefillQKVEpilogue
     private let prefillAttention: PrefillAttention
@@ -340,6 +347,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let prefillAttentionPath: RuntimePrefillAttentionPath
     private let prefillExpertStagingEnabled: Bool
     private let prefillFetchOverlapEnabled: Bool
+    private let prefillMBatchInt4Enabled: Bool
+    /// Resolved output-width floor for the batched kernel; see
+    /// `PrefillProjectionDispatchPolicy.mbatchMinimumRows`.
+    private let prefillMBatchMinimumRows: Int
+    /// Number of INT4 projections dispatched to `PrefillInt4MBatchQMM` on this
+    /// instance. Exposed for tests: nothing else reports which prefill kernel
+    /// encoded a projection.
+    private(set) var prefillMBatchInt4Dispatches = 0
     /// Experts per staging sub-burst. Sized to fill the streamer's 32-deep read
     /// pool (a tile is only eight experts) while the burst's tiles run on GPU.
     private static let prefillStagingBurstExperts = 32
@@ -380,6 +395,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         self.prefillExpertStagingEnabled = runtimeConfiguration.prefillExpertStaging
         self.prefillFetchOverlapEnabled = runtimeConfiguration.prefillFetchOverlap
+        self.prefillMBatchInt4Enabled = runtimeConfiguration.prefillMBatchInt4
+        self.prefillMBatchMinimumRows = runtimeConfiguration.prefillMBatchMinimumRows
+            ?? PrefillProjectionDispatchPolicy.mbatchMinimumRows
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
         self.rdadvisePolicyMode = runtimeConfiguration.rdadvisePolicy
         self.rdadviseAdaptiveState = RDAdviceAdaptivePolicyState(
@@ -448,6 +466,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         self.prefillRMS = try PrefillRMSNorm(context: context)
         self.prefillQMM = try PrefillInt4QMM(context: context,
                                              groupSize: int4Groups)
+        // The batched kernel is specialized for affine group 64 just like the
+        // tensor-ops path, so it is built only when the checkpoint's group size
+        // matches that fixed constant.
+        self.prefillMBatchQMM = int4Groups == Quantization.groupSize
+            ? try PrefillInt4MBatchQMM(context: context) : nil
         // `tensorops.metal` hardcodes a 64-value quantization group and is
         // compiled as a private library, where a function constant would force
         // every pipeline through the specialized-function API. A group-32
@@ -1528,6 +1551,32 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                   tokenCount: Int,
                                   xStrideElements: Int,
                                   yStrideElements: Int) {
+            // One threadgroup covers the whole token slab and every weight tile
+            // is read once for all rows, so the batched kernel wins once the
+            // output is wide enough to amortize that read. Narrow outputs stay
+            // on the per-family MPP/qmm/GEMV choice below.
+            if prefillMBatchInt4Enabled,
+               let mbatch = prefillMBatchQMM,
+               (1...PrefillInt4MBatchQMM.maxM).contains(tokenCount),
+               rows >= prefillMBatchMinimumRows,
+               columns % Quantization.groupSize == 0 {
+                prefillMBatchInt4Dispatches += 1
+                mbatch.encode(commandBuffer: commandBuffer,
+                              weights: weights.buffer,
+                              weightsOffset: Int(weights.offset),
+                              scales: weights.buffer,
+                              scalesOffset: Int(weights.scaleOffset),
+                              biases: weights.buffer,
+                              biasesOffset: Int(weights.biasOffset),
+                              x: x,
+                              y: y,
+                              m: tokenCount,
+                              n: rows,
+                              k: columns,
+                              xRowStride: xStrideElements,
+                              yRowStride: yStrideElements)
+                return
+            }
             if tokenCount >= 32,
                family == .q || family == .kv || family == .o,
                let candidate = prefillMPPAffineInt4 {

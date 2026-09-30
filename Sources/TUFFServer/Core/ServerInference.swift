@@ -556,6 +556,16 @@ public actor ServerModelSession: ServerInferenceBackend {
     /// share once, then each question's suffix from a checkpoint. Off, every
     /// question is prefilled whole, which is what the endpoint did before.
     private let systemOnePrefixReuse: Bool
+    /// `--systemone-prefix-reuse auto`: a one-question request prefills whole.
+    private let systemOnePrefixReuseMultiOnly: Bool
+    /// `--systemone-temperature`: label log-probabilities are divided by it
+    /// before renormalising. Fitted per model on labelled data.
+    private let systemOneTemperature: Double
+    /// `TUFF_SYSTEMONE_LABEL_MASS=1` logs how much of the full-vocabulary
+    /// distribution the labels hold, per question: the renormalised answer
+    /// hides it, and a small mass means the model wanted to say something else.
+    private let systemOneLogLabelMass =
+        ProcessInfo.processInfo.environment["TUFF_SYSTEMONE_LABEL_MASS"] == "1"
     /// Label → its single token id. Encoding a label is a real tokenizer call,
     /// and the same handful of labels ("Yes", "A"…) recurs across requests, so
     /// the check that a label is one token runs once per label.
@@ -614,6 +624,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
                             systemOneSystemPrompt: String? = nil,
                             systemOnePrefixReuse: Bool = true,
+                            systemOnePrefixReuseMultiOnly: Bool = false,
+                            systemOneTemperature: Double = 1,
                             runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
@@ -707,7 +719,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                                   visionCapability: visionCapability,
                                   visionResidencyPolicy: visionResidencyPolicy,
                                   systemOneSystemPrompt: systemOneSystemPrompt,
-                                  systemOnePrefixReuse: systemOnePrefixReuse)
+                                  systemOnePrefixReuse: systemOnePrefixReuse,
+                                  systemOnePrefixReuseMultiOnly: systemOnePrefixReuseMultiOnly,
+                                  systemOneTemperature: systemOneTemperature)
     }
 
     static func hardwareVisionCapability(
@@ -739,7 +753,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                  visionCapability: String,
                  visionResidencyPolicy: VisionResidencyPolicy,
                  systemOneSystemPrompt: String?,
-                 systemOnePrefixReuse: Bool) {
+                 systemOnePrefixReuse: Bool,
+                 systemOnePrefixReuseMultiOnly: Bool,
+                 systemOneTemperature: Double) {
         self.context = context
         self.model = model
         self.tokenizer = tokenizer
@@ -759,6 +775,8 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.visionCapability = visionCapability
         self.systemOneSystemPrompt = systemOneSystemPrompt
         self.systemOnePrefixReuse = systemOnePrefixReuse
+        self.systemOnePrefixReuseMultiOnly = systemOnePrefixReuseMultiOnly
+        self.systemOneTemperature = systemOneTemperature
     }
 
     // MARK: - Typed decisions
@@ -802,6 +820,8 @@ public actor ServerModelSession: ServerInferenceBackend {
         questions.reserveCapacity(request.questions.count)
         var inputTokens = 0
         var joinFailure: String?
+        let prefixReuse = systemOnePrefixReuse
+            && !(systemOnePrefixReuseMultiOnly && request.questions.count == 1)
         for question in request.questions {
             try Task.checkCancellation()
             let suffix = try SystemOnePrompt.renderSuffix(question: question)
@@ -817,7 +837,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             let labelIDs = try systemOneLabelTokenIDs(
                 for: SystemOnePrompt.labels(for: question))
             var suffixIDs: [Int32] = []
-            if systemOnePrefixReuse {
+            if prefixReuse {
                 suffixIDs = tokenizer.encode(suffix, addBOS: false)
                 // BPE can merge a token across the join, which would make the
                 // suffix alone prefill differently from the joined prompt. Any
@@ -834,7 +854,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 suffixIDs: suffixIDs, labelIDs: labelIDs))
         }
 
-        if systemOnePrefixReuse, joinFailure == nil {
+        if prefixReuse, joinFailure == nil {
             do {
                 let readouts = questions.map {
                     LabelReadout(suffixIds: $0.suffixIDs, labelIDs: $0.labelIDs)
@@ -846,11 +866,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                     scratch: scratch,
                     prefillConfig: prefillConfig)
                 let answers = try zip(questions, logProbs).map { plan, values in
-                    SystemOneAnswerEntry(
-                        key: plan.question.key,
-                        answer: try SystemOneMath.answer(
-                            for: plan.question,
-                            probabilities: SystemOneMath.probabilities(fromLogProbs: values)))
+                    try systemOneAnswerEntry(plan, labelLogProbs: values)
                 }
                 return SystemOneResponse(
                     model: request.model,
@@ -877,16 +893,27 @@ public actor ServerModelSession: ServerInferenceBackend {
                 labelIDs: plan.labelIDs,
                 scratch: scratch,
                 prefillConfig: prefillConfig)
-            answers.append(SystemOneAnswerEntry(
-                key: plan.question.key,
-                answer: try SystemOneMath.answer(
-                    for: plan.question,
-                    probabilities: SystemOneMath.probabilities(fromLogProbs: logProbs))))
+            answers.append(try systemOneAnswerEntry(plan, labelLogProbs: logProbs))
         }
         return SystemOneResponse(
             model: request.model,
             answers: SystemOneAnswers(entries: answers),
             usage: SystemOneUsage(inputTokens: inputTokens, outputTokens: 0))
+    }
+
+    private func systemOneAnswerEntry(_ plan: SystemOneQuestionTokens,
+                                      labelLogProbs: [Double]) throws -> SystemOneAnswerEntry {
+        if systemOneLogLabelMass {
+            let mass = labelLogProbs.reduce(0.0) { $0 + exp($1) }
+            FileHandle.standardError.write(Data(String(
+                format: "[systemone] label mass q=%@ %.4f\n", plan.question.key, mass).utf8))
+        }
+        return SystemOneAnswerEntry(
+            key: plan.question.key,
+            answer: try SystemOneMath.answer(
+                for: plan.question,
+                probabilities: SystemOneMath.probabilities(
+                    fromLogProbs: labelLogProbs, temperature: systemOneTemperature)))
     }
 
     /// A label the tokenizer splits into several tokens has no single readout

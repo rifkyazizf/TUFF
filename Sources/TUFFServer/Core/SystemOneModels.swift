@@ -723,7 +723,11 @@ public enum SystemOneMath {
     /// Softmax over the label log-probabilities, in Double. The readout is
     /// already a full-vocabulary log-softmax; renormalising over the labels
     /// alone is what turns it into a distribution over this question's labels.
-    public static func probabilities(fromLogProbs logProbs: [Double]) throws -> [Double] {
+    /// `temperature` divides the log-probabilities first (temperature scaling,
+    /// Guo et al. 2017): it reshapes confidence without reordering labels.
+    public static func probabilities(fromLogProbs raw: [Double],
+                                     temperature: Double = 1) throws -> [Double] {
+        let logProbs = temperature == 1 ? raw : raw.map { $0 / temperature }
         guard !logProbs.isEmpty else { throw SystemOneError.noLabelLogProbabilities }
         var maximum = -Double.infinity
         for value in logProbs where value > maximum {

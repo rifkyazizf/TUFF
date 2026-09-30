@@ -26,6 +26,13 @@ public struct ServerArguments: Equatable, Sendable {
     /// Whether /v1/systemone prefills the prefix shared by all of a request's
     /// questions once, or re-prefills each question's whole prompt.
     public let systemOnePrefixReuse: Bool
+    /// `--systemone-prefix-reuse auto`: reuse only for requests with more than
+    /// one question. A single question gains nothing from the checkpoint and
+    /// pays for a second prefill call, which reads the routed experts again.
+    public let systemOnePrefixReuseMultiOnly: Bool
+    /// Temperature applied to /v1/systemone label log-probabilities before
+    /// they are renormalised; 1 leaves them as the model produced them.
+    public let systemOneTemperature: Double
 
     public static let usage = """
     usage: TUFFServer --model <completed .gturbo directory> [options]
@@ -69,10 +76,16 @@ public struct ServerArguments: Equatable, Sendable {
       --systemone-system-prompt <text>
                                  System text appended to the /v1/systemone
                                  framing for requests that send none.
-      --systemone-prefix-reuse <on|off>
+      --systemone-prefix-reuse <on|off|auto>
                                  Prefill the prefix every /v1/systemone question
                                  shares once (default on). Off re-prefills each
-                                 question's whole prompt.
+                                 question's whole prompt; auto reuses only when
+                                 a request has more than one question.
+      --systemone-temperature <T>
+                                 Divide /v1/systemone label log-probabilities by
+                                 T before renormalising (default 1). T > 1
+                                 softens overconfident answers; it never
+                                 changes which label wins.
       --help                     Show this help.
     """
 
@@ -129,6 +142,8 @@ public struct ServerArguments: Equatable, Sendable {
         var rdadvisePolicy = RDAdvicePolicyMode.off
         var systemOneSystemPrompt: String?
         var systemOnePrefixReuse = true
+        var systemOnePrefixReuseMultiOnly = false
+        var systemOneTemperature = 1.0
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -231,12 +246,19 @@ public struct ServerArguments: Equatable, Sendable {
                 systemOneSystemPrompt = value
             case "--systemone-prefix-reuse":
                 switch value {
-                case "on": systemOnePrefixReuse = true
-                case "off": systemOnePrefixReuse = false
+                case "on": (systemOnePrefixReuse, systemOnePrefixReuseMultiOnly) = (true, false)
+                case "off": (systemOnePrefixReuse, systemOnePrefixReuseMultiOnly) = (false, false)
+                case "auto": (systemOnePrefixReuse, systemOnePrefixReuseMultiOnly) = (true, true)
                 default:
                     throw ServerArgumentError.invalid(
-                        "--systemone-prefix-reuse must be on or off")
+                        "--systemone-prefix-reuse must be on, off, or auto")
                 }
+            case "--systemone-temperature":
+                guard let parsed = Double(value), parsed.isFinite, parsed > 0, parsed <= 100 else {
+                    throw ServerArgumentError.invalid(
+                        "--systemone-temperature must be a number in (0, 100]")
+                }
+                systemOneTemperature = parsed
             case "--rdadvise":
                 guard let parsed = RDAdvicePolicyMode(rawValue: value) else {
                     throw ServerArgumentError.invalid(
@@ -265,7 +287,9 @@ public struct ServerArguments: Equatable, Sendable {
                                visionPack: visionPack,
                                visionResidency: visionResidency,
                                systemOneSystemPrompt: systemOneSystemPrompt,
-                               systemOnePrefixReuse: systemOnePrefixReuse)
+                               systemOnePrefixReuse: systemOnePrefixReuse,
+                               systemOnePrefixReuseMultiOnly: systemOnePrefixReuseMultiOnly,
+                               systemOneTemperature: systemOneTemperature)
     }
 }
 

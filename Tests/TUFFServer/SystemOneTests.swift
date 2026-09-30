@@ -867,11 +867,44 @@ struct SystemOneArgumentTests {
         let off = try ServerArguments.parse(
             ["--model", "/models/m.gturbo", "--systemone-prefix-reuse", "off"])
         #expect(!off.systemOnePrefixReuse)
+        #expect(!unflagged.systemOnePrefixReuseMultiOnly)
+        let auto = try ServerArguments.parse(
+            ["--model", "/models/m.gturbo", "--systemone-prefix-reuse", "auto"])
+        #expect(auto.systemOnePrefixReuse && auto.systemOnePrefixReuseMultiOnly)
+    }
+
+    @Test func temperatureFlagDefaultsToOneAndIsBounded() throws {
+        let unflagged = try ServerArguments.parse(["--model", "/models/m.gturbo"])
+        #expect(unflagged.systemOneTemperature == 1)
+        let set = try ServerArguments.parse(
+            ["--model", "/models/m.gturbo", "--systemone-temperature", "1.48"])
+        #expect(set.systemOneTemperature == 1.48)
+        for bad in ["0", "-1", "nan", "abc", "101"] {
+            #expect(throws: ServerArgumentError.invalid(
+                "--systemone-temperature must be a number in (0, 100]")) {
+                _ = try ServerArguments.parse(
+                    ["--model", "/models/m.gturbo", "--systemone-temperature", bad])
+            }
+        }
+    }
+
+    @Test func temperatureSoftensWithoutReordering() throws {
+        let logProbs = [log(0.7), log(0.2), log(0.1)]
+        let plain = try SystemOneMath.probabilities(fromLogProbs: logProbs)
+        let soft = try SystemOneMath.probabilities(fromLogProbs: logProbs, temperature: 2)
+        #expect(soft[0] < plain[0] && soft[2] > plain[2])
+        #expect(soft[0] > soft[1] && soft[1] > soft[2])
+        // p^(1/2) renormalised.
+        let expected = [0.7, 0.2, 0.1].map { $0.squareRoot() }
+        let total = expected.reduce(0, +)
+        for (value, want) in zip(soft, expected.map { $0 / total }) {
+            #expect(abs(value - want) < 1e-12)
+        }
     }
 
     @Test func invalidPrefixReuseFlagIsRejected() {
         #expect(throws: ServerArgumentError.invalid(
-            "--systemone-prefix-reuse must be on or off")) {
+            "--systemone-prefix-reuse must be on, off, or auto")) {
             _ = try ServerArguments.parse(
                 ["--model", "/models/m.gturbo", "--systemone-prefix-reuse", "maybe"])
         }

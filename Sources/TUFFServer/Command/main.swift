@@ -38,6 +38,8 @@ do {
         promptCacheMode: arguments.promptCacheMode,
         systemOneSystemPrompt: arguments.systemOneSystemPrompt,
         systemOnePrefixReuse: arguments.systemOnePrefixReuse,
+        systemOnePrefixReuseMultiOnly: arguments.systemOnePrefixReuseMultiOnly,
+        systemOneTemperature: arguments.systemOneTemperature,
         runtimeConfiguration: runtimeConfiguration)
     let modelID = arguments.modelIDOverride ?? backend.defaultModelID
     let server = TUFFHTTPServer(

@@ -48,6 +48,68 @@ public struct ExpertCachePlan: Sendable, Equatable {
     }
 }
 
+/// Per-`pread` latency of expert reads, collected only under
+/// `TUFF_PREFILL_PROFILE` and drained into each prefill profile report. The
+/// staged burst's wall time alone cannot say whether reads were slow one by
+/// one or merely numerous.
+final class ExpertReadStats: @unchecked Sendable {
+    static let shared = ExpertReadStats()
+    static let enabled = ["1", "2"].contains(
+        ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"])
+
+    private let lock = NSLock()
+    private var nanos: [UInt64] = []
+    private var bytes: UInt64 = 0
+
+    /// `TUFF_EXPERT_USAGE_FILE=<path>`: cumulative staged reads per layer file
+    /// and expert, rewritten as JSON at every report. How concentrated reads
+    /// are across requests decides whether pinning a hot set could beat the
+    /// OS page cache.
+    static let usagePath = ProcessInfo.processInfo.environment["TUFF_EXPERT_USAGE_FILE"]
+    private var usage: [String: [Int]] = [:]
+
+    func recordUsage(file: String, experts: [Int], expertsPerLayer: Int) {
+        lock.lock()
+        var counts = usage[file] ?? [Int](repeating: 0, count: expertsPerLayer)
+        for expert in experts where expert < counts.count {
+            counts[expert] += 1
+        }
+        usage[file] = counts
+        lock.unlock()
+    }
+
+    func record(nanos value: UInt64, bytes count: Int) {
+        lock.lock()
+        nanos.append(value)
+        bytes &+= UInt64(count)
+        lock.unlock()
+    }
+
+    /// One report line, then the counters start over.
+    func drainReport() -> String {
+        lock.lock()
+        let sorted = nanos.sorted()
+        let total = bytes
+        nanos.removeAll(keepingCapacity: true)
+        bytes = 0
+        let usageSnapshot = usage
+        lock.unlock()
+        if let path = Self.usagePath, !usageSnapshot.isEmpty,
+           let data = try? JSONSerialization.data(withJSONObject: usageSnapshot, options: [.sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+        guard !sorted.isEmpty else { return "  expert preads            none\n" }
+        func ms(_ q: Double) -> String {
+            String(format: "%.2f", Double(sorted[min(sorted.count - 1, Int(q * Double(sorted.count)))]) / 1e6)
+        }
+        let sum = sorted.reduce(0, &+)
+        return String(format: "  expert preads            %d reads, %.1f MB, summed %.1f ms; "
+                      + "p50 %@ p90 %@ p99 %@ max %@ ms\n",
+                      sorted.count, Double(total) / 1e6, Double(sum) / 1e6,
+                      ms(0.5), ms(0.9), ms(0.99), ms(1.0))
+    }
+}
+
 public enum ExpertCachePolicy: String, Sendable {
     case lru
     case lfu
@@ -218,6 +280,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         precondition(experts.count == destinations.count,
                      "expert destinations must match the expert list")
         guard !experts.isEmpty else { return }
+        if ExpertReadStats.usagePath != nil {
+            ExpertReadStats.shared.recordUsage(file: layout.path, experts: experts,
+                                               expertsPerLayer: layout.expertsPerLayer)
+        }
 
         nonisolated(unsafe) let destinationPointers = destinations
         let errorLock = NSLock()
@@ -479,6 +545,13 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     private func readFull(into destination: UnsafeMutableRawPointer,
                           fileOffset: UInt64,
                           count: Int) throws {
+        let started = ExpertReadStats.enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0
+        defer {
+            if ExpertReadStats.enabled {
+                ExpertReadStats.shared.record(
+                    nanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started, bytes: count)
+            }
+        }
         var filled = 0
         while filled < count {
             let readCount = pread(

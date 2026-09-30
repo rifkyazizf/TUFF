@@ -74,6 +74,44 @@ struct PrefillProfile {
     }
 }
 
+/// Every prefill command buffer's GPU interval, gathered from completion
+/// handlers under `TUFF_PREFILL_PROFILE`. The per-stage fields above time only
+/// the buffers at sync points; this counts all of them, so busy time against
+/// the first-start-to-last-end span shows how long the GPU sat idle between
+/// buffers (encoding, commit, and CPU-side waits).
+final class PrefillGPUClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var busy = 0.0
+    private var first = Double.infinity
+    private var last = 0.0
+
+    func track(_ commandBuffer: MTLCommandBuffer) {
+        commandBuffer.addCompletedHandler { [self] cb in
+            lock.lock()
+            count += 1
+            busy += max(0, cb.gpuEndTime - cb.gpuStartTime)
+            first = min(first, cb.gpuStartTime)
+            last = max(last, cb.gpuEndTime)
+            lock.unlock()
+        }
+    }
+
+    /// One report line, then the clock starts over.
+    func drainReport() -> String {
+        lock.lock()
+        defer {
+            count = 0; busy = 0; first = .infinity; last = 0
+            lock.unlock()
+        }
+        guard count > 0 else { return "" }
+        let span = last - first
+        return String(format: "  command buffers           %d, GPU busy %.1f ms of %.1f ms span "
+                      + "(idle between buffers %.1f ms)\n",
+                      count, busy * 1e3, span * 1e3, max(0, span - busy) * 1e3)
+    }
+}
+
 @inline(__always) func now() -> UInt64 {
     clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 }

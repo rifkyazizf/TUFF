@@ -185,6 +185,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private static let prefillGDNStageProfiling =
         ProcessInfo.processInfo.environment["TUFF_PREFILL_PROFILE"] == "2"
     private var prefillProfile = PrefillProfile()
+    private let prefillGPUClock = PrefillGPUClock()
     private let qwenSparseAttention: QwenSparseAttention?
 
     // Prefill kernels. These are initialized once per runner so the chunk path
@@ -1052,6 +1053,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
 
     private func makePrefillCommandBuffer() -> MTLCommandBuffer? {
         let commandBuffer = ctx.queue.makeCommandBuffer()
+        if Self.prefillProfilingEnabled, let commandBuffer {
+            prefillGPUClock.track(commandBuffer)
+        }
         if collectingSpeculativeMetrics, commandBuffer != nil {
             speculativeTargetCommandBuffers &+= 1
         }
@@ -1170,7 +1174,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             onProgress(span.completedCount)
         }
         if Self.prefillProfilingEnabled {
-            FileHandle.standardError.write(Data(prefillProfile.report().utf8))
+            FileHandle.standardError.write(Data(
+                (prefillProfile.report() + prefillGPUClock.drainReport()
+                    + ExpertReadStats.shared.drainReport()).utf8))
             prefillProfile = PrefillProfile()
         }
         if outputMode == .greedyIfAvailable, useFusedGreedyHead {

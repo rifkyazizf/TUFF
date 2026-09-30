@@ -303,6 +303,38 @@ import TUFFValidationSupport
         #expect(rel <= 2e-2, "full image mask rel=\(rel) maxAbs=\(maxAbs)")
     }
 
+    /// The simdgroup kernel against the CPU reference and against the tiled
+    /// kernel it replaces, at the qwen36 full-attention shape (256/16/2),
+    /// including chunks that start mid-sequence and key counts that are not a
+    /// multiple of the 8-key block.
+    /// `window` 0 is plain causal; `start + chunk` is how the runner encodes
+    /// full layers (a window spanning every valid key).
+    /// `sharp` scales the queries so scores span tens of units and the softmax
+    /// is peaked, as real activations are, rather than near-uniform.
+    @Test(arguments: [(0, 1, false, false), (0, 13, false, false), (5, 8, false, false),
+                      (127, 9, false, false), (300, 128, false, false), (1_021, 37, false, false),
+                      (0, 128, true, false), (2_371, 128, true, false),
+                      (0, 74, true, true), (210, 256, true, true), (2_371, 128, true, true)])
+    func simdgroupCausalMatchesReferenceAndTiled(start: Int, chunk: Int, runnerWindow: Bool,
+                                                 sharp: Bool) throws {
+        var fixture = Self.makeFixture(start: start, chunk: chunk,
+                                       window: runnerWindow ? start + chunk : 0,
+                                       seed: 0xA950 + UInt64(start * 131 + chunk),
+                                       headDim: 256, qHeads: 16, kvHeads: 2)
+        if sharp {
+            fixture.q = fixture.q.map { $0 * 24 }
+        }
+        let simdgroup = try Self.runKernel(fixture, simdgroupCausal: true)
+        let tiled = try Self.runKernel(fixture)
+        let reference = Self.reference(fixture)
+        let vsReference = RelError.maxAbsDiff(simdgroup, reference)
+        let vsTiled = RelError.maxAbsDiff(simdgroup, tiled)
+        print("simdgroup attention start=\(start) chunk=\(chunk) runnerWindow=\(runnerWindow) sharp=\(sharp): "
+              + "max|d| vs tiled \(vsTiled), vs reference \(vsReference)")
+        #expect(vsReference <= 2e-2, "simdgroup vs reference maxAbs=\(vsReference)")
+        #expect(vsTiled <= 1e-3, "simdgroup vs tiled maxAbs=\(vsTiled)")
+    }
+
     private static func runAndCompare(_ fixture: Fixture, label: String) throws {
         let actual = try Self.runKernel(fixture)
         let reference = Self.reference(fixture)
@@ -315,10 +347,11 @@ import TUFFValidationSupport
     private static func runKernel(
         _ fixture: Fixture,
         kvRingCapacity: UInt32 = 0,
-        path: RuntimePrefillAttentionPath = .causalTiled
+        path: RuntimePrefillAttentionPath = .causalTiled,
+        simdgroupCausal: Bool = false
     ) throws -> [Float] {
         let ctx = try MetalContext()
-        let prefill = try PrefillAttention(context: ctx)
+        let prefill = try PrefillAttention(context: ctx, simdgroupCausal: simdgroupCausal)
         let qPrefix = 17
         let kPrefix = 19
         let vPrefix = 23

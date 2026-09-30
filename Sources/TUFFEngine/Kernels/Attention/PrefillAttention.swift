@@ -56,9 +56,17 @@ final class PrefillAttention {
     private let psoCausalTiled: MTLComputePipelineState
     private let psoParamsSmoke: MTLComputePipelineState
     private let psoFullTensorOps2DValidityV2: MTLComputePipelineState?
+    /// `TUFF_PREFILL_ATTENTION_SIMDGROUP=1`: causal full-attention prefill on
+    /// 8x8 simdgroup matrices for the shape it supports (see `simdgroupShape`).
+    private let psoCausalSimdgroup: MTLComputePipelineState?
 
-    init(context: MetalContext) throws {
+    init(context: MetalContext,
+         simdgroupCausal: Bool = ProcessInfo.processInfo.environment[
+            "TUFF_PREFILL_ATTENTION_SIMDGROUP"] == "1") throws {
         self.context = context
+        self.psoCausalSimdgroup = simdgroupCausal
+            ? try context.pipeline("attention_prefill_causal_simdgroup")
+            : nil
         self.psoCausalTiled = try context.pipeline("attention_prefill_causal_tiled")
         self.psoParamsSmoke = try context.pipeline("prefill_attention_params_smoke")
         self.psoFullTensorOps2DValidityV2 = context.device.supportsFamily(.apple10)
@@ -99,6 +107,14 @@ final class PrefillAttention {
             && effectiveParams.scale == 1.0
         let tensorOpsPipeline = tensorOpsShape ? psoFullTensorOps2DValidityV2 : nil
         let useTensorOps = tensorOpsPipeline != nil
+        if !useTensorOps, let simdgroup = psoCausalSimdgroup,
+           Self.simdgroupShape(effectiveParams, kvRingCapacity: kvRingCapacity) {
+            encodeSimdgroup(commandBuffer: commandBuffer, pipeline: simdgroup,
+                            q: q, qOffset: qOffset, k: k, kOffset: kOffset,
+                            v: v, vOffset: vOffset, out: out, outOffset: outOffset,
+                            params: effectiveParams)
+            return
+        }
         let pipeline: MTLComputePipelineState
         if let tensorOpsPipeline {
             pipeline = tensorOpsPipeline
@@ -139,6 +155,44 @@ final class PrefillAttention {
         enc.endEncoding()
     }
 
+
+    /// The one shape `attention_prefill_causal_simdgroup` is written for: the
+    /// qwen36 full-attention layers (256-wide heads, 8 query heads per KV head),
+    /// plain causal visibility over a linear KV buffer. The runner passes full
+    /// layers a window as long as the valid keys, which hides nothing.
+    static func simdgroupShape(_ params: PrefillAttentionParams,
+                               kvRingCapacity: UInt32) -> Bool {
+        params.headDim == 256
+            && params.numQHeads == params.numKVHeads * 8
+            && (params.slidingWindow == 0 || params.slidingWindow >= params.kvValidCount)
+            && kvRingCapacity == 0
+            && params.bidirectionalBlockStart == params.bidirectionalBlockEnd
+    }
+
+    private func encodeSimdgroup(commandBuffer: MTLCommandBuffer,
+                                 pipeline: MTLComputePipelineState,
+                                 q: MTLBuffer, qOffset: Int,
+                                 k: MTLBuffer, kOffset: Int,
+                                 v: MTLBuffer, vOffset: Int,
+                                 out: MTLBuffer, outOffset: Int,
+                                 params: PrefillAttentionParams) {
+        // Four simdgroups per threadgroup, one query row each; must match
+        // kSimdAttnSimdgroups in prefill.metal.
+        let simdgroups = 4
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(q, offset: qOffset, index: 0)
+        enc.setBuffer(k, offset: kOffset, index: 1)
+        enc.setBuffer(v, offset: vOffset, index: 2)
+        enc.setBuffer(out, offset: outOffset, index: 3)
+        var p = params
+        enc.setBytes(&p, length: MemoryLayout<PrefillAttentionParams>.stride, index: 4)
+        enc.dispatchThreadgroups(
+            MTLSize(width: (Int(params.queryCount) + simdgroups - 1) / simdgroups,
+                    height: Int(params.numKVHeads), depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32 * simdgroups, height: 1, depth: 1))
+        enc.endEncoding()
+    }
 
     private func validate(_ params: PrefillAttentionParams) {
         precondition(params.headDim > 0, "headDim must be positive")

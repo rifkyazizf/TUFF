@@ -1124,6 +1124,118 @@ kernel void attention_prefill_causal_tiled(
     }
 }
 
+// Causal prefill attention on 8x8 simdgroup matrices (Apple7+, so M1/M2 too),
+// opt-in with TUFF_PREFILL_ATTENTION_SIMDGROUP=1. The tiled kernel above
+// reduces one key at a time with threadgroup barriers, which makes a long
+// prompt's full-attention layers the largest GPU cost of its prefill.
+//
+// One simdgroup per (query row, KV head). Under GQA the 8 query heads that
+// share a KV head are the 8 rows of every tile, so the whole tile has a single
+// causal limit. Keys advance 8 at a time with an online softmax; scores, the
+// running max/sum, and the output accumulate in FP32, as the tiled kernel does.
+// Shape: headDim 256, 8 query heads per KV head, no sliding window, ring, or
+// bidirectional block; other shapes keep the tiled kernel.
+constant constexpr uint kSimdAttnHeadDim = 256;
+constant constexpr uint kSimdAttnTiles = kSimdAttnHeadDim / 8u;
+constant constexpr uint kSimdAttnSimdgroups = 4;
+
+kernel void attention_prefill_causal_simdgroup(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device half* O [[buffer(3)]],
+    constant PrefillAttentionParams& p [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint t = tg.x * kSimdAttnSimdgroups + simd_group;
+    // Uniform per simdgroup, so no lane of a live simdgroup leaves early.
+    if (t >= p.queryCount) return;
+    const uint kvh = tg.y;
+    const uint keys = min(p.kvValidCount, p.startPosition + t + 1u);
+
+    // Element coordinates of this lane inside an 8x8 tile: it holds
+    // (fm, fn) and (fm, fn + 1). Lanes sharing a row differ in bits 0 and 3.
+    const ushort qid = lane / 4;
+    const ushort fm = (qid & 4) + ((lane / 2) % 4);
+    const ushort fn = (qid & 2) * 2 + (lane % 2) * 2;
+
+    device const half* q_rows = Q + t * p.qTokenStrideElements + (kvh * 8u) * kSimdAttnHeadDim;
+    device const half* k_base = K + kvh * kSimdAttnHeadDim;
+    device const half* v_base = V + kvh * kSimdAttnHeadDim;
+
+    simdgroup_float8x8 acc[kSimdAttnTiles];
+    for (uint j = 0; j < kSimdAttnTiles; ++j) {
+        acc[j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+
+    for (uint kb = 0; kb < keys; kb += 8u) {
+        const uint key0 = kb + fn;
+        const uint key1 = key0 + 1u;
+        const bool live0 = key0 < keys;
+        const bool live1 = key1 < keys;
+
+        // S = Q[8 heads x D] * K^T[D x 8 keys].
+        simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (uint d = 0; d < kSimdAttnHeadDim; d += 8u) {
+            simdgroup_float8x8 qt, kt;
+            device const half* q_row = q_rows + fm * kSimdAttnHeadDim + d + fn;
+            qt.thread_elements()[0] = float(q_row[0]);
+            qt.thread_elements()[1] = float(q_row[1]);
+            // K^T tile: row = dimension d + fm, column = key.
+            kt.thread_elements()[0] = live0
+                ? float(k_base[key0 * p.kvTokenStrideElements + d + fm]) : 0.0f;
+            kt.thread_elements()[1] = live1
+                ? float(k_base[key1 * p.kvTokenStrideElements + d + fm]) : 0.0f;
+            simdgroup_multiply_accumulate(s, qt, kt, s);
+        }
+
+        const float s0 = live0 ? s.thread_elements()[0] * p.scale : -INFINITY;
+        const float s1 = live1 ? s.thread_elements()[1] * p.scale : -INFINITY;
+        float block_max = max(s0, s1);
+        block_max = max(block_max, simd_shuffle_xor(block_max, ushort(1)));
+        block_max = max(block_max, simd_shuffle_xor(block_max, ushort(8)));
+        const float new_max = max(row_max, block_max);
+        const float old_scale = fast::exp(row_max - new_max);
+        const float p0 = live0 ? fast::exp(s0 - new_max) : 0.0f;
+        const float p1 = live1 ? fast::exp(s1 - new_max) : 0.0f;
+        float block_sum = p0 + p1;
+        block_sum += simd_shuffle_xor(block_sum, ushort(1));
+        block_sum += simd_shuffle_xor(block_sum, ushort(8));
+        row_sum = row_sum * old_scale + block_sum;
+        row_max = new_max;
+
+        simdgroup_float8x8 probs;
+        probs.thread_elements()[0] = p0;
+        probs.thread_elements()[1] = p1;
+
+        // acc = diag(old_scale) * acc + P[8 heads x 8 keys] * V[8 keys x D].
+        // V rows beyond the valid keys meet zero probabilities, but a stale
+        // row could hold inf/NaN, so they load as zero too.
+        const uint vkey = kb + fm;
+        const bool vlive = vkey < keys;
+        device const half* v_row = v_base + vkey * p.kvTokenStrideElements + fn;
+        for (uint j = 0; j < kSimdAttnTiles; ++j) {
+            simdgroup_float8x8 vt;
+            vt.thread_elements()[0] = vlive ? float(v_row[j * 8u]) : 0.0f;
+            vt.thread_elements()[1] = vlive ? float(v_row[j * 8u + 1u]) : 0.0f;
+            acc[j].thread_elements()[0] *= old_scale;
+            acc[j].thread_elements()[1] *= old_scale;
+            simdgroup_multiply_accumulate(acc[j], probs, vt, acc[j]);
+        }
+    }
+
+    const float inv = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    device half* out_row = O + t * p.oTokenStrideElements + (kvh * 8u + fm) * kSimdAttnHeadDim + fn;
+    for (uint j = 0; j < kSimdAttnTiles; ++j) {
+        out_row[j * 8u] = half(acc[j].thread_elements()[0] * inv);
+        out_row[j * 8u + 1u] = half(acc[j].thread_elements()[1] * inv);
+    }
+}
+
 #if defined(__HAVE_TENSOR__)
 
 constant constexpr int kPrefillTensorOpsOutputs = 8;
